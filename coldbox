@@ -1,0 +1,904 @@
+#!/usr/bin/env python3
+"""Coldbox: run CI checks in one throwaway Incus VM per job."""
+import argparse
+import fcntl
+import grp
+import ipaddress
+import json
+import os
+import pwd
+import re
+import secrets
+import shlex
+import signal
+import subprocess
+import sys
+import time
+import tomllib
+import urllib.request
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from pathlib import Path
+
+PROJECT = 'coldbox'
+BASE = 'base-dev/warm'
+IMAGE = 'images:ubuntu/26.04/cloud'
+RUNNER_RELEASES = 'https://api.github.com/repos/actions/runner/releases/latest'
+UNITS = {'': 1, 'B': 1, 'KB': 10**3, 'MB': 10**6, 'GB': 10**9, 'TB': 10**12,
+         'KiB': 2**10, 'MiB': 2**20, 'GiB': 2**30, 'TiB': 2**40}
+HOST_RESERVE = 2 * 2**30
+INCUS_COMMANDS = {'run', 'serve', 'register', 'reap', 'status'}
+GATEWAY = '10.204.0.1'
+STATE = Path(os.environ.get('COLDBOX_STATE', '/var/lib/coldbox'))
+GUEST_JOB_DIR = '/var/lib/coldbox/job'
+RUNNER = 'runner'
+SAME_REPO_EVENTS = {'push', 'workflow_dispatch', 'schedule', 'repository_dispatch', 'release', 'create', 'delete'}
+JUNIT_DIRS = dict(local=[f'{GUEST_JOB_DIR}/junit', f'/home/{RUNNER}/repo'],
+                  runner=[f'{GUEST_JOB_DIR}/junit', '/opt/actions-runner/_work'])
+JUNIT_STATUS = (('failure', 'failed'), ('error', 'error'), ('skipped', 'skipped'))
+MAX_TEST_RESULTS = 5000
+JOB_STARTED = f'{GUEST_JOB_DIR}/started'
+ARCHIVED = f'{GUEST_JOB_DIR}/archived'
+PYTEST_CONFIGS = ('pytest.ini', 'pyproject.toml', 'setup.cfg', 'tox.ini')
+LABELS = ['self-hosted', 'linux', 'x64', 'coldbox']
+CHECK_ORDER = ['setup', 'lint', 'test', 'verify']
+NAME = re.compile(r'[a-z][a-z0-9_-]*')
+RAN_A_TEST = " 2>&1 | awk '{{print}} /{}/{{ok=1}} END{{exit !ok}}' || {{ echo 'coldbox: no passing test in the output' >&2; exit 1; }}"
+GO_TEST = 'go test -v ./...' + RAN_A_TEST.format(r'^[ \t]*--- PASS')
+CARGO_TEST = 'cargo test' + RAN_A_TEST.format(r'^test result: ok\. [1-9]')
+RUST_TEST = re.compile(r'#\[(?:\w+::)*test\]')
+TARGET = re.compile(r'[A-Za-z0-9][A-Za-z0-9-]*(/[A-Za-z0-9_.-]+)?')
+SKIP_DIRS = {'node_modules', 'target', 'vendor'}
+
+
+class ConfigError(Exception):
+    pass
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+
+def new_id():
+    return f'cbx-{int(time.time())}-{secrets.token_hex(3)}'
+
+
+def write_json(path, data):
+    path = Path(path)
+    tmp = path.with_suffix('.tmp')
+    tmp.write_text(json.dumps(data, indent=2) + '\n')
+    tmp.replace(path)
+
+
+def size_bytes(text):
+    match = re.fullmatch(r'\s*(\d+(?:\.\d+)?)\s*([KMGT]i?B|B)?\s*', text)
+    if not match:
+        raise ValueError(f'cannot read size {text!r}')
+    return int(float(match[1]) * UNITS[match[2] or ''])
+
+
+def host_memory():
+    for line in Path('/proc/meminfo').read_text().splitlines():
+        if line.startswith('MemTotal:'):
+            return int(line.split()[1]) * 1024
+    raise RuntimeError('MemTotal missing from /proc/meminfo')
+
+
+def fits(slots, vm_memory, host):
+    return slots * vm_memory <= host - HOST_RESERVE
+
+
+def runner_release(release):
+    version = release['tag_name'].removeprefix('v')
+    name = f'actions-runner-linux-x64-{version}.tar.gz'
+    asset = next((a for a in release.get('assets', []) if a['name'] == name), None)
+    if not asset:
+        raise RuntimeError(f'actions/runner {version} has no {name}')
+    digest = (asset.get('digest') or '').removeprefix('sha256:')
+    if not digest:
+        match = re.search(r'BEGIN SHA linux-x64 -->\s*([0-9a-f]{64})', release.get('body') or '')
+        digest = match[1] if match else ''
+    if not re.fullmatch(r'[0-9a-f]{64}', digest):
+        raise RuntimeError(f'actions/runner {version}: no sha256 for {name}')
+    return version, asset['browser_download_url'], digest
+
+
+def detect(root):
+    root = Path(root)
+
+    def has(*names):
+        return any((root / name).exists() for name in names)
+
+    def files(pattern):
+        return [p for p in root.rglob(pattern)
+                if not any(part.startswith('.') or part in SKIP_DIRS for part in p.relative_to(root).parts)]
+
+    found = {}
+
+    def add(check, command):
+        found.setdefault(check, []).append(command)
+
+    if has('pyproject.toml', 'setup.py', 'setup.cfg', 'requirements.txt') or files('*.py'):
+        if has('requirements.txt'):
+            add('setup', 'pip3 install -r requirements.txt')
+        add('lint', "python3 -m compileall -q -x '/[.]|node_modules' .")
+        if files('test_*.py') or files('*_test.py'):
+            add('test', 'python3 -m pytest -q')
+    if has('package.json'):
+        scripts = json.loads((root / 'package.json').read_text()).get('scripts', {})
+        add('setup', 'npm ci' if has('package-lock.json') else 'npm install')
+        if 'lint' in scripts:
+            add('lint', 'npm run lint')
+        if 'test' in scripts and 'no test specified' not in scripts['test']:
+            add('test', 'npm test')
+    if has('go.mod'):
+        add('lint', 'test -z "$(gofmt -l .)" && go vet ./...')
+        if files('*_test.go'):
+            add('test', GO_TEST)
+    if has('Cargo.toml'):
+        add('lint', 'cargo fmt --check && cargo clippy --all-targets -- -D warnings')
+        if any(RUST_TEST.search(p.read_text(errors='replace')) for p in files('*.rs')):
+            add('test', CARGO_TEST)
+    if files('*.sh'):
+        add('lint', "find . -name '*.sh' -not -path '*/.*' -not -path '*/node_modules/*' -print0 | xargs -0 shellcheck")
+    if has('verify.sh'):
+        add('verify', 'bash verify.sh')
+    return found
+
+
+def load_config(root):
+    path = Path(root) / 'coldbox.toml'
+    if not path.exists():
+        return {}, {}
+    try:
+        data = tomllib.loads(path.read_text())
+    except tomllib.TOMLDecodeError as error:
+        raise ConfigError(f'coldbox.toml: {error}')
+    unknown = set(data) - {'checks', 'commands'}
+    if unknown:
+        raise ConfigError(f'coldbox.toml: unknown section {sorted(unknown)[0]!r}; use [checks] and [commands]')
+    switches, commands = data.get('checks', {}), data.get('commands', {})
+    for section, table, kind in (('checks', switches, bool), ('commands', commands, str)):
+        if not isinstance(table, dict):
+            raise ConfigError(f'coldbox.toml: [{section}] must be a table')
+        for name, value in table.items():
+            if not NAME.fullmatch(name):
+                raise ConfigError(f'coldbox.toml: bad check name {name!r} in [{section}]')
+            if type(value) is not kind or (kind is str and not value.strip()):
+                raise ConfigError(f'coldbox.toml: [{section}] {name} must be {"true or false" if kind is bool else "a command string"}')
+    return switches, commands
+
+
+def plan(root):
+    switches, overrides = load_config(root)
+    found = detect(root)
+    found.update({name: [command] for name, command in overrides.items()})
+    missing = [name for name, on in switches.items() if on and name not in found]
+    if missing:
+        raise ConfigError(f'coldbox.toml: check {missing[0]!r} is on but nothing was detected; add it under [commands]')
+    names = [n for n in CHECK_ORDER if n in found] + [n for n in found if n not in CHECK_ORDER]
+    return [(name, found[name]) for name in names if switches.get(name, True)]
+
+
+def run_checks(root, out=None):
+    steps = plan(root)
+    results, setup_failed = [], False
+    for name, commands in steps:
+        for command in commands:
+            if setup_failed:
+                results.append(dict(check=name, command=command, status='skipped', exit=None, seconds=0))
+                continue
+            print(f'== coldbox {name}: {command}', flush=True)
+            started = time.monotonic()
+            env = dict(os.environ)
+            if out and not sets_junitxml(root, command):
+                junit = f"--junitxml={Path(out).parent / 'junit' / f'{len(results)}.xml'}"
+                env['PYTEST_ADDOPTS'] = ' '.join(filter(None, [os.environ.get('PYTEST_ADDOPTS'), junit]))
+            code = subprocess.run(['bash', '-eo', 'pipefail', '-c', command], cwd=root, env=env).returncode
+            results.append(dict(check=name, command=command, status='pass' if code == 0 else 'fail',
+                                exit=code, seconds=round(time.monotonic() - started, 3)))
+            setup_failed = name == 'setup' and code != 0
+    verdict = 'pass' if results and all(r['status'] == 'pass' for r in results) else 'fail'
+    summary = dict(verdict=verdict, checks=results)
+    if not results:
+        summary['error'] = 'no checks to run'
+    if out:
+        write_json(out, summary)
+    for r in results:
+        print(f"{r['status'].upper():8} {r['check']:8} {r['seconds']:8.1f}s  {r['command']}")
+    print(f'coldbox checks: {verdict.upper()}' + (' (nothing to run)' if not results else ''))
+    return 0 if verdict == 'pass' else 1
+
+
+def sets_junitxml(root, command):
+    configs = [Path(root) / name for name in PYTEST_CONFIGS]
+    texts = [command, os.environ.get('PYTEST_ADDOPTS', '')]
+    texts += [path.read_text(errors='replace') for path in configs if path.is_file()]
+    return any('junitxml' in text for text in texts)
+
+
+def tracked(path):
+    return subprocess.run(['git', '-C', str(path.parent), 'ls-files', '--error-unmatch', '--', path.name],
+                          capture_output=True).returncode == 0
+
+
+def junit_files(dirs, since=0, archived=frozenset()):
+    for top in dirs:
+        for root, subdirs, names in os.walk(top):
+            subdirs[:] = sorted(d for d in subdirs if not d.startswith('.') and d not in ('node_modules', 'vendor'))
+            for name in sorted(names):
+                path = Path(root) / name
+                try:
+                    if not name.endswith('.xml') or path.stat().st_mtime < since:
+                        continue
+                    with path.open('rb') as report:
+                        if b'<testsuite' in report.read(4096) and str(path) not in archived and not tracked(path):
+                            yield path
+                except OSError:
+                    pass
+
+
+def junit_seconds(text):
+    try:
+        return round(float(text), 3)
+    except (TypeError, ValueError):
+        return None
+
+
+def junit_summary(dirs, newer=None, archived=None):
+    files, results = [], []
+    skip = frozenset(Path(archived).read_text().splitlines()) if archived else frozenset()
+    for path in junit_files(dirs, os.stat(newer).st_mtime if newer else 0, skip):
+        try:
+            report = ET.parse(path).getroot()
+        except (ET.ParseError, OSError):
+            continue
+        files.append(str(path))
+        for suite in report.iter('testsuite'):
+            for case in suite.findall('testcase'):
+                status = next((s for tag, s in JUNIT_STATUS if case.find(tag) is not None), 'passed')
+                results.append(dict(suite=suite.get('name', ''), classname=case.get('classname', ''),
+                                    name=case.get('name', ''), status=status, seconds=junit_seconds(case.get('time'))))
+    counts = {status: sum(r['status'] == status for r in results) for status in ('passed', 'failed', 'error', 'skipped')}
+    return dict(files=files, total=len(results), **counts, truncated=len(results) > MAX_TEST_RESULTS,
+                results=results[:MAX_TEST_RESULTS])
+
+
+def job_started(env=None):
+    env = os.environ if env is None else env
+    event = {}
+    if env.get('GITHUB_EVENT_PATH'):
+        event = json.loads(Path(env['GITHUB_EVENT_PATH']).read_text())
+    name = env.get('GITHUB_EVENT_NAME') or ''
+    fork = None if name not in SAME_REPO_EVENTS else False
+    pr = event.get('pull_request')
+    if pr:
+        repos = (pr.get('head') or {}).get('repo'), (pr.get('base') or {}).get('repo')
+    elif name == 'workflow_run':
+        repos = (event.get('workflow_run') or {}).get('head_repository'), event.get('repository')
+    if pr or name == 'workflow_run':
+        head, base = ((repo or {}).get('full_name') for repo in repos)
+        fork = head is None or head != base
+    refused = None
+    if fork is not False and env.get('COLDBOX_ALLOW_FORKS') != '1':
+        refused = 'fork pull request' if fork else f'{name or "unknown"} event: cannot tell whether the code is from a fork'
+    job = dict(repo=env.get('GITHUB_REPOSITORY'), sha=env.get('GITHUB_SHA'), ref=env.get('GITHUB_REF'),
+               event=name, workflow=env.get('GITHUB_WORKFLOW'), job=env.get('GITHUB_JOB'),
+               run_id=env.get('GITHUB_RUN_ID'), run_attempt=env.get('GITHUB_RUN_ATTEMPT'),
+               actor=env.get('GITHUB_ACTOR'), fork_pr=fork, refused=refused)
+    if env.get('COLDBOX_JOB_DIR'):
+        write_json(Path(env['COLDBOX_JOB_DIR']) / 'job.json', job)
+    if refused:
+        print(f'coldbox: refusing this job ({refused}); register with --allow-forks to run it', file=sys.stderr)
+        return 1
+    return 0
+
+
+def acl_document(addresses):
+    blocked = ['0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8', '169.254.0.0/16', '172.16.0.0/12',
+               '192.0.0.0/24', '192.0.2.0/24', '192.168.0.0/16', '198.18.0.0/15', '198.51.100.0/24',
+               '203.0.113.0/24', '224.0.0.0/4', '240.0.0.0/4']
+    public = [ipaddress.ip_network('0.0.0.0/0')]
+    for cidr in blocked:
+        net = ipaddress.ip_network(cidr)
+        public = [part for old in public for part in (old.address_exclude(net) if net.subnet_of(old) else [old])]
+    egress = [dict(action='allow', state='enabled', destination=str(net)) for net in public]
+    for protocol, ports in (('udp', '53,67'), ('tcp', '53')):
+        egress.append(dict(action='allow', state='enabled', destination=GATEWAY, protocol=protocol,
+                           destination_port=ports))
+    egress.append(dict(action='allow', state='enabled', destination='255.255.255.255', protocol='udp',
+                       destination_port='67'))
+    for interface in addresses:
+        for addr in interface.get('addr_info', []):
+            if addr['family'] == 'inet' and ipaddress.ip_address(addr['local']).is_global:
+                egress.insert(0, dict(action='reject', state='enabled', destination=addr['local']))
+    ingress = [dict(action='allow', state='enabled', source=GATEWAY, protocol='udp', source_port='67',
+                    destination_port='68')]
+    return dict(description='Coldbox: public internet only; no LAN, tailnet or host',
+                config={'user.coldbox.managed': 'true'},
+                ingress=ingress, egress=egress)
+
+
+def host_addresses():
+    return json.loads(subprocess.run(['ip', '-j', 'address', 'show'], check=True, capture_output=True,
+                                     text=True).stdout)
+
+
+def sync_acl():
+    subprocess.run(['incus', '--force-local', 'network', 'acl', 'edit', 'coldbox-isolated'],
+                   input=json.dumps(acl_document(host_addresses())), check=True, capture_output=True, text=True)
+
+
+def query(path):
+    return json.loads(subprocess.run(['incus', '--force-local', 'query', path], check=True, capture_output=True,
+                                     text=True).stdout)
+
+
+def ic(*args, **kwargs):
+    return subprocess.run(['incus', '--force-local', '--project', PROJECT, *args], check=True, text=True,
+                          stdin=subprocess.DEVNULL, capture_output=True, **kwargs).stdout
+
+
+def ic_exec(name, *command, user=RUNNER, cwd=None, env=(), timeout=None):
+    prefix = ['timeout', '--signal=KILL', str(max(1, int(timeout)))] if timeout else []
+    args = ['incus', '--force-local', '--project', PROJECT, 'exec', name, '--mode', 'non-interactive']
+    if user:
+        args += ['--env', f'HOME=/home/{user}']
+        command = ('runuser', '-u', user, '--', *command)
+    if cwd:
+        args += ['--cwd', cwd]
+    for item in env:
+        args += ['--env', item]
+    return prefix + args + ['--', *command]
+
+
+def tee(command, log, data=None):
+    proc = subprocess.Popen(command, stdin=subprocess.PIPE if data is not None else subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if data is not None:
+        proc.stdin.write(data)
+        proc.stdin.close()
+    for line in proc.stdout:
+        log.write(line)
+        log.flush()
+        sys.stdout.buffer.write(line)
+        sys.stdout.flush()
+    return proc.wait()
+
+
+def isolated(name, offline):
+    vm = query(f'/1.0/instances/{name}?project={PROJECT}')
+    devices, config = vm.get('expanded_devices', {}), vm.get('expanded_config', {})
+    root, nic = devices.get('root', {}), devices.get('eth0', {})
+    problems = []
+    if vm.get('type') != 'virtual-machine':
+        problems.append('not a VM')
+    if set(devices) != {'root', 'eth0'}:
+        problems.append(f'unexpected devices {sorted(devices)}')
+    if root.get('type') != 'disk' or root.get('path') != '/' or root.get('source'):
+        problems.append('root disk is not a plain pool volume')
+    if offline and nic.get('type') != 'none':
+        problems.append('offline VM still has a NIC')
+    if not offline and (nic.get('type') != 'nic' or nic.get('network') != 'coldboxbr0'
+                        or nic.get('security.port_isolation') != 'true'):
+        problems.append('NIC is not on the isolated coldboxbr0 bridge')
+    if any(key.startswith('raw.') for key in config):
+        problems.append('raw.* config present')
+    if problems:
+        raise RuntimeError('Refusing unsafe VM: ' + '; '.join(problems))
+
+
+def wait_ready(name, expires, network):
+    while subprocess.run(ic_exec(name, 'true', user=None, timeout=10), capture_output=True).returncode:
+        if time.time() > expires:
+            raise RuntimeError('VM agent not ready before TTL')
+        time.sleep(1)
+    if network:
+        code = subprocess.run(ic_exec(name, 'cloud-init', 'status', '--wait', user=None,
+                                      timeout=expires - time.time()), capture_output=True).returncode
+        if code not in (0, 2):
+            raise RuntimeError(f'cloud-init failed in VM (exit {code})')
+
+
+def pull(name, path):
+    result = subprocess.run(['incus', '--force-local', '--project', PROJECT, 'file', 'pull', f'{name}{path}', '-'],
+                            capture_output=True, text=True)
+    return json.loads(result.stdout) if result.returncode == 0 and result.stdout.strip() else None
+
+
+def destroy(name):
+    subprocess.run(['incus', '--force-local', '--project', PROJECT, 'delete', name, '--force'], capture_output=True)
+    info = subprocess.run(['incus', '--force-local', '--project', PROJECT, 'info', name], capture_output=True)
+    return info.returncode != 0 and b'Instance not found' in info.stderr
+
+
+def job(mode, name, ttl, command, repo, sha=None, stdin=None, archive=None, offline=False, cwd=None, env=(),
+        extra=None):
+    receipts = STATE / 'receipts'
+    receipts.mkdir(parents=True, exist_ok=True)
+    path, log_path = receipts / f'{name}.json', receipts / f'{name}.log'
+    started = time.time()
+    expires = int(started + ttl)
+    receipt = dict(schema='coldbox.receipt/v1', id=name, mode=mode, repo=repo, sha=sha, verdict='incomplete',
+                   checks=[], started_at=now_iso(), log=str(log_path), **(extra or {}),
+                   vm=dict(name=name, image=BASE, ttl_seconds=ttl, offline=offline, destroyed=False))
+    write_json(path, receipt)
+    guest_env = [f'COLDBOX_JOB_DIR={GUEST_JOB_DIR}', 'PIP_BREAK_SYSTEM_PACKAGES=1', *env]
+    with log_path.open('ab') as log:
+        try:
+            sync_acl()
+            ic('copy', BASE, name, '--config', f'user.coldbox.expires={expires}')
+            if offline:
+                ic('config', 'device', 'add', name, 'eth0', 'none')
+            isolated(name, offline)
+            ic('start', name)
+            wait_ready(name, expires, network=not offline)
+            receipt['vm']['ready_seconds'] = round(time.time() - started, 3)
+            ic('file', 'push', str(Path(__file__).resolve()), f'{name}/usr/local/bin/coldbox', '--mode', '0755')
+            if archive is not None:
+                extract = f'mkdir -p ~/repo && tar -x -v -C ~/repo | sed "s|^|$HOME/repo/|" > {ARCHIVED}'
+                subprocess.run(ic_exec(name, 'bash', '-o', 'pipefail', '-c', extract), input=archive,
+                               check=True, capture_output=True)
+            subprocess.run(ic_exec(name, 'touch', JOB_STARTED), check=True, capture_output=True)
+            command_started = time.time()
+            code = tee(ic_exec(name, *command, cwd=cwd, env=guest_env, timeout=expires - time.time()), log, stdin)
+            receipt['job_seconds'] = round(time.time() - command_started, 3)
+            receipt['exit'] = code
+            if mode == 'runner':
+                receipt['job_name'], receipt['job_result'] = job_outcome(log_path.read_bytes())
+            if code in (124, 137) and time.time() >= expires - 1:
+                receipt['error'] = 'TTL reached'
+            github, result = pull(name, f'{GUEST_JOB_DIR}/job.json'), pull(name, f'{GUEST_JOB_DIR}/checks.json')
+            if github:
+                receipt.update(github=github, repo=github['repo'] or repo, sha=github['sha'])
+            if result:
+                receipt.update(checks=result['checks'], checks_verdict=result['verdict'])
+            tests = subprocess.run(ic_exec(name, 'coldbox', 'junit', '--newer', JOB_STARTED,
+                                           *(['--archived', ARCHIVED] if archive is not None else []),
+                                           *JUNIT_DIRS[mode], timeout=120),
+                                   capture_output=True, text=True)
+            if tests.returncode == 0 and json.loads(tests.stdout)['total']:
+                receipt['tests'] = json.loads(tests.stdout)
+        except subprocess.CalledProcessError as error:
+            stderr = error.stderr.decode() if isinstance(error.stderr, bytes) else error.stderr or ''
+            receipt['error'] = f"{' '.join(map(str, error.cmd[:7]))} failed: {stderr.strip()[-500:]}"
+        except (OSError, RuntimeError, ValueError) as error:
+            receipt['error'] = str(error)
+        except (SystemExit, KeyboardInterrupt):
+            receipt['error'] = 'stopped'
+            raise
+        finally:
+            gone = destroy(name)
+            ended = time.time()
+            receipt['vm'].update(destroyed=gone, destroyed_at=now_iso(), lifetime_seconds=round(ended - started, 3))
+            receipt['seconds'] = round(ended - started, 3)
+            receipt['verdict'] = verdict(receipt)
+            write_json(path, receipt)
+    print(f"coldbox: {receipt['verdict'].upper()} receipt {path}", file=sys.stderr)
+    return receipt
+
+
+def job_outcome(log):
+    found = re.findall(rb'Job (.+) completed with result: (\w+)', log)
+    return tuple(part.decode(errors='replace') for part in found[-1]) if found else (None, None)
+
+
+def verdict(receipt):
+    if not receipt['vm']['destroyed']:
+        return 'incomplete'
+    if (receipt.get('github') or {}).get('refused'):
+        return 'refused'
+    if receipt.get('checks_verdict') == 'fail' or receipt.get('job_result') == 'Failed':
+        return 'fail'
+    if receipt.get('error'):
+        idle = receipt['mode'] == 'runner' and 'github' not in receipt and receipt['error'] == 'TTL reached'
+        return 'idle' if idle else 'incomplete'
+    if receipt['mode'] == 'runner' and receipt.get('job_result') == 'Succeeded' and receipt.get('github'):
+        return 'pass'
+    if receipt['mode'] == 'local' and receipt.get('checks_verdict') == 'pass' and receipt.get('exit') == 0:
+        return 'pass'
+    return 'incomplete'
+
+
+def git(path, *args):
+    return subprocess.run(['git', '-C', str(path), *args], check=True, capture_output=True).stdout
+
+
+def run_local(args):
+    path = Path(args.path).resolve()
+    sha = git(path, 'rev-parse', 'HEAD').decode().strip()
+    remote = subprocess.run(['git', '-C', str(path), 'remote', 'get-url', 'origin'], capture_output=True, text=True)
+    match = re.search(r'[:/]([^/:]+/[^/]+?)(\.git)?$', remote.stdout.strip())
+    if git(path, 'status', '--porcelain', '--', 'coldbox.toml').strip():
+        raise SystemExit('coldbox: commit coldbox.toml first; the VM runs the committed HEAD')
+    plan(path)
+    receipt = job('local', new_id(), args.ttl, ['coldbox', 'checks'], repo=match[1] if match else path.name,
+                  sha=sha, archive=git(path, 'archive', '--format=tar', 'HEAD'), offline=args.offline,
+                  cwd='/home/runner/repo')
+    return exit_code(receipt)
+
+
+def gh(*args, body=None):
+    command = ['gh', 'api', *args] + (['--input', '-'] if body is not None else [])
+    result = subprocess.run(command, input=json.dumps(body) if body is not None else None, capture_output=True,
+                            text=True)
+    if result.returncode:
+        raise RuntimeError(f'gh api {" ".join(args)}: {result.stderr.strip() or result.stdout.strip()}')
+    return json.loads(result.stdout) if result.stdout.strip() else None
+
+
+def scope(target):
+    if not TARGET.fullmatch(target):
+        raise SystemExit(f'coldbox: {target!r} is not OWNER/REPO or ORG')
+    return f'repos/{target}' if '/' in target else f'orgs/{target}'
+
+
+def guard(target, allow_public):
+    if '/' in target:
+        public = gh(scope(target))['visibility'] != 'private'
+        what = f'{target} is not a private repository'
+    else:
+        public = gh(f'orgs/{target}/actions/runner-groups/1')['allows_public_repositories']
+        what = f"org {target}'s default runner group allows public repositories"
+    if public and not allow_public:
+        raise SystemExit(f'coldbox: refusing: {what}. Fork pull requests on public repositories can run code on '
+                         'this machine. Pass --allow-public only if you accept that.')
+
+
+def stop_once(*_):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    sys.exit(143)
+
+
+def exit_code(receipt):
+    return {'pass': 0, 'fail': 1}.get(receipt['verdict'], 125)
+
+
+def serve_slots(args):
+    argv = [sys.executable, str(Path(__file__).resolve()), 'serve', args.target, '--slots', '1', '--ttl', str(args.ttl)]
+    argv += ['--allow-public'] * args.allow_public + ['--allow-forks'] * args.allow_forks + ['--once'] * args.once
+    children = [subprocess.Popen(argv) for _ in range(args.slots)]
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, lambda *_: [child.send_signal(signal.SIGTERM) for child in children])
+    if args.once:
+        return max(child.wait() for child in children)
+    while all(child.poll() is None for child in children):
+        time.sleep(1)
+    for child in children:
+        if child.poll() is None:
+            child.send_signal(signal.SIGTERM)
+    return max(child.wait() for child in children) or 1
+
+
+def serve(args):
+    if args.slots > 1:
+        return serve_slots(args)
+    signal.signal(signal.SIGTERM, stop_once)
+    env = ['ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/coldbox-job-started.sh']
+    if args.allow_forks:
+        env.append('COLDBOX_ALLOW_FORKS=1')
+    while True:
+        guard(args.target, args.allow_public)
+        name = new_id()
+        runner = gh('-X', 'POST', f'{scope(args.target)}/actions/runners/generate-jitconfig',
+                    body=dict(name=name, runner_group_id=1, labels=LABELS, work_folder='_work'))
+        try:
+            print(f'coldbox: runner {name} waiting for a job on {args.target}', file=sys.stderr, flush=True)
+            receipt = job('runner', name, args.ttl, ['sh', '-c', 'read -r c; exec ./run.sh --jitconfig "$c"'],
+                          repo=args.target, stdin=(runner['encoded_jit_config'] + '\n').encode(),
+                          cwd='/opt/actions-runner', env=env, extra=dict(runner_id=runner['runner']['id']))
+        finally:
+            try:
+                gh('-X', 'DELETE', f"{scope(args.target)}/actions/runners/{runner['runner']['id']}")
+            except RuntimeError:
+                pass
+        if args.once:
+            return exit_code(receipt)
+        if 'job_seconds' not in receipt:
+            time.sleep(30)
+
+
+def instance(target):
+    return subprocess.run(['systemd-escape', target], check=True, capture_output=True, text=True).stdout.strip()
+
+
+def registrations():
+    listed = subprocess.run(['systemctl', 'list-units', 'coldbox-runner@*', '--all', '--plain', '--no-legend'],
+                            capture_output=True, text=True).stdout
+    found = []
+    for line in listed.splitlines():
+        unit, _load, active = line.split()[:3]
+        escaped = unit.split('@', 1)[1].removesuffix('.service')
+        target = subprocess.run(['systemd-escape', '--unescape', escaped], capture_output=True, text=True).stdout
+        conf = Path(f'/etc/systemd/system/{unit}.d/coldbox.conf')
+        match = re.search(r'COLDBOX_SLOTS=(\d+)', conf.read_text()) if conf.exists() else None
+        found.append(dict(unit=unit, target=target.strip(), active=active, slots=int(match[1]) if match else 1))
+    return found
+
+
+def vm_memory():
+    return size_bytes(ic('profile', 'get', 'coldbox', 'limits.memory').strip())
+
+
+def register(args):
+    if args.slots < 1:
+        raise SystemExit('coldbox: --slots must be at least 1')
+    others = sum(r['slots'] for r in registrations() if r['active'] == 'active' and r['target'] != args.target)
+    memory, host = vm_memory(), host_memory()
+    if not fits(args.slots + others, memory, host):
+        raise SystemExit(f'coldbox: {args.slots + others} job VMs of {memory / 2**30:g} GiB do not fit in '
+                         f'{host / 2**30:.0f} GiB of RAM (2 GiB stays with the host). Use fewer --slots, or reinstall '
+                         'with a smaller COLDBOX_MEMORY.')
+    guard(args.target, args.allow_public)
+    unit = f'coldbox-runner@{instance(args.target)}.service'
+    dropin = f'[Service]\nEnvironment=COLDBOX_ALLOW_PUBLIC={int(args.allow_public)}\n' \
+             f'Environment=COLDBOX_ALLOW_FORKS={int(args.allow_forks)}\nEnvironment=COLDBOX_SLOTS={args.slots}\n'
+    subprocess.run(['sudo', 'mkdir', '-p', f'/etc/systemd/system/{unit}.d'], check=True)
+    subprocess.run(['sudo', 'tee', f'/etc/systemd/system/{unit}.d/coldbox.conf'], input=dropin, text=True,
+                   check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(['sudo', 'systemctl', 'daemon-reload'], check=True)
+    subprocess.run(['sudo', 'systemctl', 'enable', unit], check=True)
+    subprocess.run(['sudo', 'systemctl', 'restart', unit], check=True)
+    print(f'coldbox: {unit} running {args.slots} job VM slot(s). '
+          f'Add runs-on: [self-hosted, coldbox] to a workflow in {args.target}.')
+    return 0
+
+
+def unregister(args):
+    unit = f'coldbox-runner@{instance(args.target)}.service'
+    subprocess.run(['sudo', 'systemctl', 'disable', '--now', unit], check=False)
+    subprocess.run(['sudo', 'rm', '-rf', f'/etc/systemd/system/{unit}.d'], check=True)
+    subprocess.run(['sudo', 'systemctl', 'daemon-reload'], check=True)
+    listed = subprocess.run(['gh', 'api', '--paginate', f'{scope(args.target)}/actions/runners?per_page=100', '--jq',
+                             '.runners[] | select(.name | startswith("cbx-")) | .id'], capture_output=True, text=True)
+    if listed.returncode:
+        raise RuntimeError(f'gh api runners: {listed.stderr.strip()}')
+    ids = listed.stdout.split()
+    for runner_id in ids:
+        gh('-X', 'DELETE', f'{scope(args.target)}/actions/runners/{runner_id}')
+    print(f'coldbox: stopped {unit}; deleted {len(ids)} coldbox runner registration(s) from {args.target}')
+    return 0
+
+
+def reap(args):
+    failed = 0
+    try:
+        sync_acl()
+    except Exception as error:
+        failed += 1
+        print(f'coldbox reap: FAILED to refresh network ACL: {error}', file=sys.stderr)
+    for vm in json.loads(ic('list', '--format', 'json')):
+        expires = vm.get('config', {}).get('user.coldbox.expires')
+        if vm['name'].startswith('cbx-') and expires and int(expires) < time.time():
+            gone = destroy(vm['name'])
+            failed += not gone
+            print(f"coldbox reap: {vm['name']} {'deleted' if gone else 'FAILED to delete'}")
+    if args.keep_days > 0:
+        cutoff = time.time() - args.keep_days * 86400
+        old = [path for path in (STATE / 'receipts').glob('cbx-*') if path.stat().st_mtime < cutoff]
+        for path in old:
+            path.unlink(missing_ok=True)
+        if old:
+            print(f'coldbox reap: deleted {len(old)} receipt file(s) older than {args.keep_days} days')
+    return int(bool(failed))
+
+
+def fetch_json(url):
+    request = urllib.request.Request(url, headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'coldbox'})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.load(response)
+
+
+GUEST_SETUP = r'''set -euxo pipefail
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -q
+apt-get upgrade -y -q
+apt-get install -y -q --no-install-recommends ca-certificates curl git jq unzip zstd xz-utils build-essential \
+    python3 python3-pip python3-venv python3-pytest nodejs npm golang-go rustc cargo rustfmt rust-clippy \
+    shellcheck sudo docker.io docker-buildx docker-compose-v2
+id runner >/dev/null 2>&1 || useradd -m -u 1001 -s /bin/bash runner
+echo 'runner ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/runner
+usermod -aG docker runner
+systemctl disable docker.service
+systemctl enable docker.socket
+install -d -o runner -g runner /opt/actions-runner /var/lib/coldbox/job
+curl -fsSL -o /tmp/runner.tgz "$RUNNER_URL"
+echo "$RUNNER_SHA256  /tmp/runner.tgz" | sha256sum -c
+tar -xzf /tmp/runner.tgz -C /opt/actions-runner
+rm /tmp/runner.tgz
+chown -R runner:runner /opt/actions-runner
+/opt/actions-runner/bin/installdependencies.sh
+printf '#!/bin/sh\nexec /usr/local/bin/coldbox job-started\n' >/opt/coldbox-job-started.sh
+chmod 755 /opt/coldbox-job-started.sh
+apt-get clean
+cloud-init clean --logs --machine-id
+rm -f /var/lib/dbus/machine-id
+'''
+
+
+def swap_base():
+    destroy('base-old')
+    try:
+        ic('move', 'base-dev', 'base-old')
+    except subprocess.CalledProcessError:
+        ic('move', 'base-new', 'base-dev')
+        return
+    try:
+        ic('move', 'base-new', 'base-dev')
+    except subprocess.CalledProcessError:
+        ic('move', 'base-old', 'base-dev')
+        raise
+    destroy('base-old')
+
+
+def build_base(_args):
+    if os.geteuid() != 0:
+        raise SystemExit('coldbox build-base: run with sudo')
+    with open(STATE / 'build-base.lock', 'w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        version = build_new_base()
+        swap_base()
+    print(f'coldbox build-base: PASS base-dev/warm built with actions-runner {version}')
+    return 0
+
+
+def build_new_base():
+    version, url, digest = runner_release(fetch_json(RUNNER_RELEASES))
+    new = 'base-new'
+    destroy(new)
+    try:
+        ic('launch', IMAGE, new, '--vm', '--profile', 'coldbox')
+        wait_ready(new, time.time() + 900, network=True)
+        subprocess.run(ic_exec(new, 'env', f'RUNNER_URL={url}', f'RUNNER_SHA256={digest}', 'bash', '-s', user=None),
+                       input=GUEST_SETUP.encode(), check=True)
+        ic('stop', new)
+        ic('config', 'set', new, f'user.coldbox.runner={version}')
+        ic('snapshot', 'create', new, 'warm')
+    except BaseException:
+        destroy(new)
+        raise
+    return version
+
+
+def status(_args):
+    failures = []
+
+    def check(ok, text, fix):
+        print(f"{'PASS' if ok else 'FAIL'}  {text}")
+        if not ok:
+            print(f'      fix: {fix}')
+            failures.append(text)
+
+    check(Path('/dev/kvm').exists(), 'hardware virtualization (/dev/kvm)', 'enable VT-x/AMD-V in the BIOS')
+    check(subprocess.run(['gh', 'auth', 'status'], capture_output=True).returncode == 0, 'gh is logged in',
+          'gh auth login')
+    for timer in ('coldbox-reap.timer', 'coldbox-refresh.timer'):
+        active = subprocess.run(['systemctl', 'is-active', '--quiet', timer]).returncode == 0
+        check(active, f'{timer} is active', 'sudo ./install.sh')
+    registered = registrations()
+    try:
+        snapshot = query(f'/1.0/instances/base-dev/snapshots/warm?project={PROJECT}')
+        runner = query(f'/1.0/instances/base-dev?project={PROJECT}')['config'].get('user.coldbox.runner', 'unknown')
+        built = datetime.fromisoformat(snapshot['created_at'][:19]).replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - built).days
+        check(age <= 14, f'base image built {age} day(s) ago, actions-runner {runner}', 'sudo coldbox build-base')
+        space = query('/1.0/storage-pools/coldbox/resources')['space']
+        check(space['used'] < 0.9 * space['total'],
+              f"storage pool coldbox: {space['used'] / 2**30:.0f} of {space['total'] / 2**30:.0f} GiB used",
+              'run coldbox reap, or reinstall with a larger COLDBOX_POOL_SIZE')
+        memory, host = vm_memory(), host_memory()
+        slots = sum(r['slots'] for r in registered if r['active'] == 'active')
+        check(fits(slots, memory, host), f"job VMs: {ic('profile', 'get', 'coldbox', 'limits.cpu').strip()} vCPU, "
+              f'{memory / 2**30:g} GiB each; {slots} slot(s) registered, {host / 2**30:.0f} GiB RAM',
+              'unregister a repo or register again with fewer --slots')
+        vms = [vm for vm in json.loads(ic('list', '--format', 'json')) if vm['name'].startswith('cbx-')]
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        check(False, 'Coldbox is installed (base-dev/warm, storage pool, profile)', 'sudo ./install.sh')
+        vms = []
+    print('\nRunners')
+    for r in registered:
+        print(f"  {r['target']:32} {r['active']:10} {r['slots']} slot(s)")
+    if not registered:
+        print('  none: coldbox register OWNER/REPO')
+    print('\nJob VMs')
+    for vm in vms:
+        left = int(vm['config'].get('user.coldbox.expires', 0)) - time.time()
+        print(f"  {vm['name']:24} {vm['status']:10} expires in {max(0, left) / 60:.0f} min")
+    if not vms:
+        print('  none')
+    print('\nRecent receipts')
+    receipts = sorted((STATE / 'receipts').glob('cbx-*.json'), key=lambda path: path.stat().st_mtime)[-5:]
+    for path in reversed(receipts):
+        r = json.loads(path.read_text())
+        print(f"  {r['id']:24} {r['verdict']:10} {r['repo'] or '':32} {r.get('seconds', 0):6.0f}s  {r['started_at']}")
+    if not receipts:
+        print('  none')
+    return 1 if failures else 0
+
+
+def detect_cmd(args):
+    found = detect(args.path)
+    if not found:
+        print('coldbox: no checks detected; write [commands] in coldbox.toml yourself', file=sys.stderr)
+        return 1
+    print('# coldbox.toml: set a check to false to switch it off; replace a command under [commands].')
+    print('[checks]')
+    for name in [n for n in CHECK_ORDER if n in found] + [n for n in found if n not in CHECK_ORDER]:
+        print(f'{name} = true  # ' + ' ; '.join(found[name]))
+    return 0
+
+
+def incus_group_exec(argv):
+    if os.geteuid() == 0:
+        return
+    try:
+        group = grp.getgrnam('incus-admin')
+    except KeyError:
+        return
+    if group.gr_gid in (os.getegid(), *os.getgroups()) or pwd.getpwuid(os.getuid()).pw_name not in group.gr_mem:
+        return
+    os.execvp('sg', ['sg', 'incus-admin', '-c', shlex.join([sys.executable, str(Path(__file__).resolve()), *argv])])
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    parser = argparse.ArgumentParser(prog='coldbox', description=__doc__)
+    sub = parser.add_subparsers(dest='cmd', required=True)
+    p = sub.add_parser('detect', help='print a suggested coldbox.toml for a repo')
+    p.add_argument('path', nargs='?', default='.')
+    p = sub.add_parser('checks', help='run the enabled checks here (used inside the VM)')
+    p.add_argument('path', nargs='?', default='.')
+    p = sub.add_parser('run', help="run a local repo's checks in a throwaway VM and write a receipt")
+    p.add_argument('path', nargs='?', default='.')
+    p.add_argument('--offline', action='store_true', help='give the VM no network at all')
+    p.add_argument('--ttl', type=int, default=3600, help='VM lifetime limit in seconds (default 3600)')
+    for name, text in (('serve', 'run ephemeral runners for a repo or org in a loop'),
+                       ('register', 'start a coldbox runner service for a repo or org')):
+        p = sub.add_parser(name, help=text)
+        p.add_argument('target', help='OWNER/REPO or ORG')
+        p.add_argument('--allow-public', action='store_true', default=os.environ.get('COLDBOX_ALLOW_PUBLIC') == '1')
+        p.add_argument('--allow-forks', action='store_true', default=os.environ.get('COLDBOX_ALLOW_FORKS') == '1')
+        p.add_argument('--slots', type=int, default=int(os.environ.get('COLDBOX_SLOTS', '1')),
+                       help='job VMs that may run at once (default 1)')
+        if name == 'serve':
+            p.add_argument('--once', action='store_true', help='stop after one VM')
+            p.add_argument('--ttl', type=int, default=21600, help='VM lifetime limit in seconds (default 21600)')
+    p = sub.add_parser('unregister', help='stop the runner service and delete coldbox runners on GitHub')
+    p.add_argument('target')
+    p = sub.add_parser('reap', help='delete job VMs past their TTL and old receipts')
+    p.add_argument('--keep-days', type=int, default=30, help='delete receipts older than this; 0 keeps all')
+    sub.add_parser('status', help='health checks, runners, job VMs and recent receipts')
+    sub.add_parser('build-base', help='rebuild base-dev/warm with current packages and actions-runner (sudo)')
+    sub.add_parser('acl', help='print the network ACL that install.sh applies')
+    sub.add_parser('job-started', help='runner hook: refuse fork PRs and record the job')
+    p = sub.add_parser('junit', help='print per-test results from JUnit XML reports under DIRs as JSON')
+    p.add_argument('--newer', help='only reports modified after this file; git-tracked reports are always skipped')
+    p.add_argument('--archived', help='file listing paths copied in from git archive; those are skipped too')
+    p.add_argument('dirs', nargs='+')
+    args = parser.parse_args(argv)
+    if args.cmd in INCUS_COMMANDS:
+        incus_group_exec(argv)
+    try:
+        if args.cmd == 'checks':
+            out = os.environ.get('COLDBOX_JOB_DIR')
+            return run_checks(args.path, out and Path(out) / 'checks.json')
+        if args.cmd == 'acl':
+            print(json.dumps(acl_document(host_addresses()), indent=2))
+            return 0
+        if args.cmd == 'job-started':
+            return job_started()
+        if args.cmd == 'junit':
+            print(json.dumps(junit_summary(args.dirs, args.newer, args.archived)))
+            return 0
+        return dict(detect=detect_cmd, run=run_local, serve=serve, register=register, unregister=unregister,
+                    reap=reap, status=status, **{'build-base': build_base})[args.cmd](args)
+    except ConfigError as error:
+        print(f'coldbox: {error}', file=sys.stderr)
+        return 2
+    except (RuntimeError, subprocess.CalledProcessError) as error:
+        print(f'coldbox: {error}', file=sys.stderr)
+        return 125
+
+
+if __name__ == '__main__':
+    sys.exit(main())

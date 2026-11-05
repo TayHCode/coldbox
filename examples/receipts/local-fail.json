@@ -1,0 +1,74 @@
+{
+  "schema": "coldbox.receipt/v1",
+  "id": "cbx-1793850021-40a9a6",
+  "mode": "local",
+  "repo": "calc-fail",
+  "sha": "9ed3cd41cf204a11ed7ea60c1143eda6c99c2bad",
+  "verdict": "fail",
+  "checks": [
+    {
+      "check": "lint",
+      "command": "python3 -m compileall -q -x '/[.]|node_modules' .",
+      "status": "pass",
+      "exit": 0,
+      "seconds": 0.044
+    },
+    {
+      "check": "test",
+      "command": "python3 -m pytest -q",
+      "status": "fail",
+      "exit": 1,
+      "seconds": 0.23
+    }
+  ],
+  "started_at": "2026-11-05T03:40:21+00:00",
+  "log": "/var/lib/coldbox/receipts/cbx-1793850021-40a9a6.log",
+  "vm": {
+    "name": "cbx-1793850021-40a9a6",
+    "image": "base-dev/warm",
+    "ttl_seconds": 3600,
+    "offline": false,
+    "destroyed": true,
+    "ready_seconds": 21.57,
+    "destroyed_at": "2026-11-05T03:40:45+00:00",
+    "lifetime_seconds": 24.209
+  },
+  "job_seconds": 0.604,
+  "exit": 1,
+  "checks_verdict": "fail",
+  "tests": {
+    "files": [
+      "/var/lib/coldbox/job/junit/1.xml"
+    ],
+    "total": 3,
+    "passed": 0,
+    "failed": 2,
+    "error": 0,
+    "skipped": 1,
+    "truncated": false,
+    "results": [
+      {
+        "suite": "pytest",
+        "classname": "test_calc",
+        "name": "test_add",
+        "status": "failed",
+        "seconds": 0.001
+      },
+      {
+        "suite": "pytest",
+        "classname": "test_calc",
+        "name": "test_add_negative",
+        "status": "failed",
+        "seconds": 0.0
+      },
+      {
+        "suite": "pytest",
+        "classname": "test_calc",
+        "name": "test_divide",
+        "status": "skipped",
+        "seconds": 0.0
+      }
+    ]
+  },
+  "seconds": 24.209
+}

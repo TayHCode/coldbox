@@ -1,0 +1,566 @@
+{
+  "schema": "coldbox.receipt/v1",
+  "id": "cbx-1793850054-43d1de",
+  "mode": "runner",
+  "repo": "TayHCode/example-repo",
+  "sha": "47eb51b670cd4ee8e6c96678713d1538fe712edf",
+  "verdict": "pass",
+  "checks": [
+    {
+      "check": "lint",
+      "command": "python3 -m compileall -q -x '/[.]|node_modules' .",
+      "status": "pass",
+      "exit": 0,
+      "seconds": 0.082
+    },
+    {
+      "check": "lint",
+      "command": "find . -name '*.sh' -not -path '*/.*' -not -path '*/node_modules/*' -print0 | xargs -0 shellcheck",
+      "status": "pass",
+      "exit": 0,
+      "seconds": 0.437
+    },
+    {
+      "check": "test",
+      "command": "python3 -m pytest -q",
+      "status": "pass",
+      "exit": 0,
+      "seconds": 97.9
+    }
+  ],
+  "started_at": "2026-11-05T03:40:54+00:00",
+  "log": "/var/lib/coldbox/receipts/cbx-1793850054-43d1de.log",
+  "runner_id": 21,
+  "vm": {
+    "name": "cbx-1793850054-43d1de",
+    "image": "base-dev/warm",
+    "ttl_seconds": 21600,
+    "offline": false,
+    "destroyed": true,
+    "ready_seconds": 31.706,
+    "destroyed_at": "2026-11-05T03:43:17+00:00",
+    "lifetime_seconds": 142.3
+  },
+  "job_seconds": 107.512,
+  "exit": 0,
+  "job_name": "checks",
+  "job_result": "Succeeded",
+  "github": {
+    "repo": "TayHCode/example-repo",
+    "sha": "47eb51b670cd4ee8e6c96678713d1538fe712edf",
+    "ref": "refs/heads/main",
+    "event": "workflow_dispatch",
+    "workflow": "coldbox",
+    "job": "checks",
+    "run_id": "41963130060",
+    "run_attempt": "1",
+    "actor": "TayHCode",
+    "fork_pr": false,
+    "refused": null
+  },
+  "checks_verdict": "pass",
+  "tests": {
+    "files": [
+      "/var/lib/coldbox/job/junit/2.xml"
+    ],
+    "total": 70,
+    "passed": 70,
+    "failed": 0,
+    "error": 0,
+    "skipped": 0,
+    "truncated": false,
+    "results": [
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_abandoned_copy_lock_expires_without_wrapper",
+        "status": "passed",
+        "seconds": 2.732
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_abandoned_process_is_reaped_without_its_finally",
+        "status": "passed",
+        "seconds": 1.281
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_acl_allows_public_and_gateway_services_but_not_private_or_host",
+        "status": "passed",
+        "seconds": 0.012
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_batch_barrier_records_running_guests_without_zfs",
+        "status": "passed",
+        "seconds": 0.064
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_bridge_acl_and_port_isolation_required_before_start",
+        "status": "passed",
+        "seconds": 1.191
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_capacity_pool_backing_and_probe_errors_refuse_before_copy",
+        "status": "passed",
+        "seconds": 2.744
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_cleanup_failure_is_incomplete_and_retains_guest_status",
+        "status": "passed",
+        "seconds": 3.205
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_cleanup_requires_observed_absence",
+        "status": "passed",
+        "seconds": 3.186
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_clone_host_mounts_and_raw_overrides_are_refused_before_start",
+        "status": "passed",
+        "seconds": 1.643
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_cloud_init_exit_2_is_a_warning_and_other_failures_still_fail",
+        "status": "passed",
+        "seconds": 4.379
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_coldbox_clone_deletes_unsafe_guest_and_spares_existing_one",
+        "status": "passed",
+        "seconds": 0.04
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_coldbox_clone_failure_spares_a_guest_with_another_token",
+        "status": "passed",
+        "seconds": 0.032
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_coldbox_delete_refuses_unmarked_spinup_guest",
+        "status": "passed",
+        "seconds": 0.008
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_coldbox_delete_removes_owned_spinup_guest",
+        "status": "passed",
+        "seconds": 0.011
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_collision_does_not_delete_existing_vm",
+        "status": "passed",
+        "seconds": 0.09
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_completed_receipt_survives_expiry_and_reused_name",
+        "status": "passed",
+        "seconds": 1.447
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_concurrent_output_preserves_all_active_disk_reservations",
+        "status": "passed",
+        "seconds": 0.154
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_copy_or_api_failure_never_deletes_a_vm",
+        "status": "passed",
+        "seconds": 0.666
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_documented_git_bundle_job_checks_exact_candidate_and_new_base",
+        "status": "passed",
+        "seconds": 0.095
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_dry_runs_invoke_no_commands_even_with_empty_path",
+        "status": "passed",
+        "seconds": 0.107
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_evidence_write_failure_cannot_return_success",
+        "status": "passed",
+        "seconds": 1.232
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_expiry_reaper_preserves_active_foreign_base_and_evidence",
+        "status": "passed",
+        "seconds": 3.178
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_failed_copy_retains_reservation_until_allocation_is_resolved",
+        "status": "passed",
+        "seconds": 1.367
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_final_cleanup_failure_receipt_is_saved_under_cleanup_lock",
+        "status": "passed",
+        "seconds": 1.698
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_guest_failure_is_preserved_through_cleanup",
+        "status": "passed",
+        "seconds": 1.636
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_guest_invocation_errors_return_guest_status",
+        "status": "passed",
+        "seconds": 0.085
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_guest_output_stops_before_consuming_operating_reserve",
+        "status": "passed",
+        "seconds": 1.511
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_guest_runner_preserves_failure_argv_and_stdin_on_real_python",
+        "status": "passed",
+        "seconds": 0.052
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_hung_readiness_probe_reports_timeout_and_cleans_up",
+        "status": "passed",
+        "seconds": 2.01
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_input_bundle_reaches_only_the_guest_command",
+        "status": "passed",
+        "seconds": 1.602
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_interrupted_copy_stays_pending_and_late_vm_is_reaped",
+        "status": "passed",
+        "seconds": 2.245
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_live_verifier_logic_with_fake_independent_reaper",
+        "status": "passed",
+        "seconds": 7.424
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_live_verifier_rejects_bad_guest_evidence_and_missing_timer",
+        "status": "passed",
+        "seconds": 3.132
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_long_guest_does_not_block_other_jobs_or_expiry",
+        "status": "passed",
+        "seconds": 4.604
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_measure_batch_of_one_writes_batch_receipt",
+        "status": "passed",
+        "seconds": 0.079
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_measure_deletes_guest_when_it_refuses_a_container_clone",
+        "status": "passed",
+        "seconds": 0.1
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_measure_discard_only_deletes_the_guest_it_created",
+        "status": "passed",
+        "seconds": 0.235
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_measure_discard_reports_failure_instead_of_raising_on_timeout",
+        "status": "passed",
+        "seconds": 0.065
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_measure_discard_treats_a_missing_guest_as_clean_but_other_errors_as_failure",
+        "status": "passed",
+        "seconds": 0.065
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_measure_guard_deletes_guest_created_after_sigkill",
+        "status": "passed",
+        "seconds": 6.067
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_measure_guard_disarmed_after_confirmed_cleanup",
+        "status": "passed",
+        "seconds": 6.118
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_measure_guard_never_deletes_a_replacement_guest",
+        "status": "passed",
+        "seconds": 6.068
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_offline_base_accepts_recoverable_cloud_init_status",
+        "status": "passed",
+        "seconds": 0.043
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_offline_base_fails_on_cloud_init_error",
+        "status": "passed",
+        "seconds": 0.021
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_partial_copy_failure_destroys_only_token_owned_vm",
+        "status": "passed",
+        "seconds": 1.387
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_populated_dir_storage_can_be_reused_on_bootstrap",
+        "status": "passed",
+        "seconds": 0.052
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_profile_with_host_mount_is_refused_without_mutation",
+        "status": "passed",
+        "seconds": 0.053
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_raw_disk_and_conflicting_options_rejected_in_dry_run",
+        "status": "passed",
+        "seconds": 0.044
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_readiness_preserves_reaper_completion_before_name_reuse",
+        "status": "passed",
+        "seconds": 1.251
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_reaper_refuses_reused_name_or_unreadable_host",
+        "status": "passed",
+        "seconds": 1.792
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_reaper_rereads_receipt_after_wrapper_finishes",
+        "status": "passed",
+        "seconds": 2.083
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_replacement_vm_never_receives_old_start",
+        "status": "passed",
+        "seconds": 0.87
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_request_must_cover_disk_and_active_reservations",
+        "status": "passed",
+        "seconds": 2.055
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_resource_creation_is_idempotent_and_never_updates",
+        "status": "passed",
+        "seconds": 0.146
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_signal_destroys_owned_vm_and_preserves_signal_status",
+        "status": "passed",
+        "seconds": 1.453
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_spinup_timed_out_tests_keep_partial_log",
+        "status": "passed",
+        "seconds": 0.05
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_start_and_cloud_init_failure_are_cleaned_up",
+        "status": "passed",
+        "seconds": 2.299
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_storage_loop_reuse_refuses_raw_source",
+        "status": "passed",
+        "seconds": 0.108
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_summarizer_reads_sampler_output_layout",
+        "status": "passed",
+        "seconds": 0.037
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_summarizer_reports_batch_with_one_host_sample",
+        "status": "passed",
+        "seconds": 0.057
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_timed_out_tests_keep_partial_logs_before_guest_deletion",
+        "status": "passed",
+        "seconds": 0.101
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_timeout_cleans_up_and_never_runs_guest_command",
+        "status": "passed",
+        "seconds": 2.499
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_transport_or_missing_result_is_incomplete_not_a_guest_verdict",
+        "status": "passed",
+        "seconds": 3.301
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_unowned_existing_dataset_is_refused",
+        "status": "passed",
+        "seconds": 0.076
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_verify_missing_snapshot_never_spawns",
+        "status": "passed",
+        "seconds": 0.106
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_wrapper_preserves_argv_and_deletes_successful_vm",
+        "status": "passed",
+        "seconds": 2.056
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_scripts.Scripts",
+        "name": "test_wrapper_preserves_reaper_completion_before_name_reuse",
+        "status": "passed",
+        "seconds": 1.911
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_sizing.Sizing",
+        "name": "test_bootstrap_defaults_are_guest_allocations",
+        "status": "passed",
+        "seconds": 0.002
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_sizing.Sizing",
+        "name": "test_confirmed_ram_inventory",
+        "status": "passed",
+        "seconds": 0.0
+      },
+      {
+        "suite": "pytest",
+        "classname": "tests.test_sizing.Sizing",
+        "name": "test_current_docs_describe_general_compute_host",
+        "status": "passed",
+        "seconds": 0.002
+      }
+    ]
+  },
+  "seconds": 142.3
+}

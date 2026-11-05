@@ -1,0 +1,16 @@
+name: Feature request
+description: Suggest a change
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem do you want solved?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you change?
+      description: Coldbox stays small. Say what you would add and what you would leave out.
+    validations:
+      required: true

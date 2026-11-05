@@ -1,0 +1,8 @@
+name: coldbox
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  checks:
+    runs-on: [self-hosted, coldbox]
+    steps:
+      - uses: actions/checkout@v4
+      - run: coldbox checks

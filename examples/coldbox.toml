@@ -1,0 +1,10 @@
+# Every detected check runs unless switched off here.
+[checks]
+lint = true
+test = true
+verify = false
+
+# Optional: replace a detected command, or add your own check.
+[commands]
+test = "python3 -m pytest -q tests"
+typecheck = "npx tsc --noEmit"
