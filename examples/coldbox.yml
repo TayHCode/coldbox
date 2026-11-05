@@ -4,5 +4,5 @@ jobs:
   checks:
     runs-on: [self-hosted, coldbox]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: coldbox checks

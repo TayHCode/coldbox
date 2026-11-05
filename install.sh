@@ -2,10 +2,23 @@
 set -euo pipefail
 
 die() { printf 'coldbox install: %s\n' "$*" >&2; exit 1; }
-[[ ${1:-} != -h && ${1:-} != --help ]] || {
-    echo 'usage: sudo ./install.sh   (env: COLDBOX_STORAGE=zfs|dir COLDBOX_POOL_SIZE COLDBOX_CPUS COLDBOX_MEMORY COLDBOX_DISK COLDBOX_REBUILD=1)'
-    exit 0
-}
+usage='usage: sudo ./install.sh [--cpus N] [--memory SIZE] [--disk SIZE]   (env: COLDBOX_STORAGE=zfs|dir COLDBOX_POOL_SIZE COLDBOX_CPUS COLDBOX_MEMORY COLDBOX_DISK COLDBOX_REBUILD=1)'
+while (( $# )); do
+    case $1 in
+        -h|--help) echo "$usage"; exit 0 ;;
+        --cpus|--memory|--disk)
+            (( $# > 1 )) || die "$1 needs a value"
+            if [[ $1 == --cpus ]]; then
+                [[ $2 =~ ^[1-9][0-9]*$ ]] || die "--cpus must be a whole number, got '$2'"
+            else
+                [[ $2 =~ ^[1-9][0-9]*(MiB|GiB|TiB|MB|GB|TB)$ ]] || die "$1 must be a size such as 8GiB, got '$2'"
+            fi
+            option=${1#--}
+            printf -v "COLDBOX_${option^^}" %s "$2"
+            shift 2 ;;
+        *) die "unknown option $1; $usage" ;;
+    esac
+done
 [[ $EUID == 0 ]] || die 'run with sudo'
 user=${SUDO_USER:-}
 [[ -n $user && $user != root ]] || die 'run with sudo from the account that will own receipts and runners'
@@ -147,7 +160,7 @@ WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
 systemctl enable --now coldbox-reap.timer coldbox-refresh.timer
-echo "coldbox install: job VMs get $cpus vCPU, $memory RAM, $disk disk (COLDBOX_CPUS/MEMORY/DISK override)"
+echo "coldbox install: job VMs get $cpus vCPU, $memory RAM, $disk disk (--cpus/--memory/--disk override)"
 
 if [[ ${COLDBOX_REBUILD:-} == 1 ]] || ! icp snapshot show base-dev warm >/dev/null 2>&1; then
     /usr/local/bin/coldbox build-base

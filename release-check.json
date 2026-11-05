@@ -69,7 +69,7 @@
     {"scope": "tree", "kind": "tailnet-ip", "path": "tests/test_coldbox.py", "fingerprint": "d72676dfa714edb2", "reason": "The CGNAT range that the ACL blocks, or a documentation address inside it used by its test."}
   ],
   "quickstart": [
-    {"file": "README.md", "line": 64, "argv": ["./coldbox", "--help"]}
+    {"file": "README.md", "line": 65, "argv": ["./coldbox", "--help"]}
   ],
   "checks": [
     {"role": "tests", "argv": ["python3", "-m", "unittest", "discover", "-s", "tests", "-q"]}

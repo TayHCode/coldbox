@@ -36,13 +36,14 @@ A self-hosted runner executes whatever a workflow tells it to. Coldbox limits wh
 - At least 4 GiB of RAM and 50 GiB free under `/var/lib`. `install.sh` checks both and stops with the fix if they are missing.
 - `gh auth login` done by an account with admin rights on the repo (or org) you register.
 
-macOS, Windows and ARM hosts are not supported: Coldbox needs Incus, which needs a Linux host. An old laptop or desktop
-with Linux on it is the target.
+macOS, Windows and ARM hosts are not supported: Coldbox needs Incus with KVM on a Linux host. WSL2 on a Windows 11 PC
+gave no `/dev/kvm`, so `install.sh` stops at its first check. An old laptop or desktop with Linux on it is the target.
 
 ## Quickstart
 
 ```sh
 git clone https://github.com/TayHCode/coldbox.git && cd coldbox && sudo ./install.sh
+gh auth login                                                                          # once, as an admin of the repo
 coldbox detect ~/src/myrepo > ~/src/myrepo/coldbox.toml                                 # review, switch checks on/off
 git -C ~/src/myrepo add coldbox.toml && git -C ~/src/myrepo commit -m 'Add coldbox.toml' # run uses the committed HEAD
 coldbox run ~/src/myrepo                                                                # checks in a throwaway VM
@@ -96,28 +97,36 @@ typecheck = "npx tsc --noEmit"
 ```
 
 Order: setup, lint, test, verify, then your own checks. A failed setup skips the rest, and a repo with nothing to run fails.
+In a job on a Coldbox runner, each failed check also becomes an error annotation, and one more annotation names up to ten
+failed tests from the JUnit report Coldbox asks pytest for (not a `--junitxml` the project sets itself). The reason then
+shows on the check run and the pull request, not only in the log.
 
 ### What is in the VM
 
 Ubuntu 26.04 with git, Docker (with compose and buildx), Python 3.14 + pytest, Node 22 + npm, Go 1.26, Rust 1.93 +
-clippy/rustfmt, shellcheck, build-essential, curl, jq, passwordless sudo and the newest actions-runner. These toolchains are
-Ubuntu's own packages, so they are older than the ones on GitHub's hosted image. For current versions, use the usual setup
+clippy/rustfmt, shellcheck, restic, rclone, build-essential, curl, jq, passwordless sudo and the newest actions-runner.
+These toolchains are Ubuntu's own packages, so they are older than the ones on GitHub's hosted image. For current versions, use the usual setup
 actions (`actions/setup-node`, `actions/setup-python`, `actions/setup-go`, `dtolnay/rust-toolchain`), which work unchanged.
 
 `coldbox-refresh.timer` rebuilds the base VM every week with updated packages and the newest actions-runner, so jobs do not
 start by updating the runner. Run `sudo coldbox build-base` to do it now. Jobs that are running keep their VM.
 
+To add your own files to every job VM, put them under `/etc/coldbox/guest/` on the host at the path they should have in the
+VM, then run `sudo coldbox build-base`. For example, `/etc/coldbox/guest/opt/tools/run` becomes `/opt/tools/run`. They are
+copied owned by root with their modes kept, and the copy is taken again at each build.
+
 ### VM size
 
 `install.sh` sizes job VMs from the host: half its CPU threads (2 to 8) and half its RAM (2 to 16 GiB), with a 40 GiB disk.
-Set `COLDBOX_CPUS`, `COLDBOX_MEMORY` or `COLDBOX_DISK` and re-run it to change that. `coldbox register --slots N` runs up to N
+To choose the size yourself, re-run it with flags, for example `sudo ./install.sh --cpus 4 --memory 8GiB --disk 60GiB`
+(or set `COLDBOX_CPUS`, `COLDBOX_MEMORY`, `COLDBOX_DISK`). `coldbox register --slots N` runs up to N
 jobs at once for a repo. It refuses if all registered slots together would leave the host less than 2 GiB of RAM.
 
 ## Commands
 
 | Command | What it does |
 | --- | --- |
-| `sudo ./install.sh` | Installs Incus, ZFS loop pool `coldbox` (`COLDBOX_STORAGE=dir` for plain directories), bridge, ACL, profile sized from the host, base VM `base-dev` with snapshot `warm`, reaper and refresh timers and the CLI. Safe to re-run; `COLDBOX_REBUILD=1` rebuilds the base. |
+| `sudo ./install.sh [--cpus N] [--memory SIZE] [--disk SIZE]` | Installs Incus, ZFS loop pool `coldbox` (`COLDBOX_STORAGE=dir` for plain directories), bridge, ACL, profile sized from the host, base VM `base-dev` with snapshot `warm`, reaper and refresh timers and the CLI. Safe to re-run; `COLDBOX_REBUILD=1` rebuilds the base. |
 | `coldbox status` | Health checks with fixes, registered repos, job VMs and recent receipts. Exit 1 if a check fails. |
 | `coldbox run PATH [--offline]` | Copies the committed HEAD (`git archive`) into a fresh VM, runs `coldbox checks`, writes a receipt, destroys the VM. Exit 0 pass, 1 fail, 125 incomplete. |
 | `coldbox register OWNER/REPO [--slots N]` or `ORG` | Starts `coldbox-runner@…` (systemd): N loops of one VM waiting for one job, receipt, destroy, repeat. |
@@ -170,7 +179,7 @@ in tight timeouts.
 
 ## Limitations
 
-- Linux x86_64 hosts only (Incus with KVM). No macOS, Windows or ARM hosts, and job VMs are Ubuntu 26.04 only.
+- Linux x86_64 hosts only (Incus with KVM). No macOS, Windows (WSL2 included) or ARM hosts, and job VMs are Ubuntu 26.04 only.
 - Not faster per job than hosted runners on single-threaded suites; the gains are cost, queue time and parallel slots.
 - No dependency cache between jobs: every VM starts clean, so jobs download their packages every time.
 - One host serves the repos registered on it. There is no pool of hosts and no autoscaling beyond `--slots`.

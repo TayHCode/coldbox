@@ -31,6 +31,7 @@ INCUS_COMMANDS = {'run', 'serve', 'register', 'reap', 'status'}
 GATEWAY = '10.204.0.1'
 STATE = Path(os.environ.get('COLDBOX_STATE', '/var/lib/coldbox'))
 GUEST_JOB_DIR = '/var/lib/coldbox/job'
+GUEST_FILES = Path('/etc/coldbox/guest')
 RUNNER = 'runner'
 SAME_REPO_EVENTS = {'push', 'workflow_dispatch', 'schedule', 'repository_dispatch', 'release', 'create', 'delete'}
 JUNIT_DIRS = dict(local=[f'{GUEST_JOB_DIR}/junit', f'/home/{RUNNER}/repo'],
@@ -183,6 +184,7 @@ def plan(root):
 def run_checks(root, out=None):
     steps = plan(root)
     results, setup_failed = [], False
+    junit_dir = out and Path(out).parent / 'junit' / str(os.getpid())
     for name, commands in steps:
         for command in commands:
             if setup_failed:
@@ -192,7 +194,7 @@ def run_checks(root, out=None):
             started = time.monotonic()
             env = dict(os.environ)
             if out and not sets_junitxml(root, command):
-                junit = f"--junitxml={Path(out).parent / 'junit' / f'{len(results)}.xml'}"
+                junit = f"--junitxml={junit_dir / f'{len(results)}.xml'}"
                 env['PYTEST_ADDOPTS'] = ' '.join(filter(None, [os.environ.get('PYTEST_ADDOPTS'), junit]))
             code = subprocess.run(['bash', '-eo', 'pipefail', '-c', command], cwd=root, env=env).returncode
             results.append(dict(check=name, command=command, status='pass' if code == 0 else 'fail',
@@ -207,7 +209,27 @@ def run_checks(root, out=None):
     for r in results:
         print(f"{r['status'].upper():8} {r['check']:8} {r['seconds']:8.1f}s  {r['command']}")
     print(f'coldbox checks: {verdict.upper()}' + (' (nothing to run)' if not results else ''))
+    if os.environ.get('GITHUB_ACTIONS') == 'true':
+        annotate(results, junit_dir)
     return 0 if verdict == 'pass' else 1
+
+
+def annotate(results, junit_dir):
+    def error(title, message):
+        message = message.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+        print(f'::error title={title}::{message}', flush=True)
+
+    tests = junit_summary([junit_dir]) if junit_dir else dict(failed=0, error=0, results=[])
+    count = tests['failed'] + tests['error']
+    names = ['.'.join(filter(None, (t['classname'], t['name'])))
+             for t in tests['results'] if t['status'] in ('failed', 'error')][:10]
+    if count:
+        error(f'coldbox {count} test(s) failed', ', '.join(names + ['...'] * (count > len(names))))
+    for r in results:
+        if r['status'] == 'fail':
+            error(f"coldbox {r['check']} failed", f"{r['command']} exited {r['exit']}")
+    if not results:
+        error('coldbox found nothing to run', 'switch a check on or add one under [commands] in coldbox.toml')
 
 
 def sets_junitxml(root, command):
@@ -695,7 +717,7 @@ apt-get update -q
 apt-get upgrade -y -q
 apt-get install -y -q --no-install-recommends ca-certificates curl git jq unzip zstd xz-utils build-essential \
     python3 python3-pip python3-venv python3-pytest nodejs npm golang-go rustc cargo rustfmt rust-clippy \
-    shellcheck sudo docker.io docker-buildx docker-compose-v2
+    shellcheck restic rclone sudo docker.io docker-buildx docker-compose-v2
 id runner >/dev/null 2>&1 || useradd -m -u 1001 -s /bin/bash runner
 echo 'runner ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/runner
 usermod -aG docker runner
@@ -742,6 +764,21 @@ def build_base(_args):
     return 0
 
 
+def push_guest_files(name):
+    if not GUEST_FILES.is_dir():
+        return
+    pack = subprocess.Popen(['tar', '-C', str(GUEST_FILES), '--owner=0', '--group=0', '--numeric-owner', '-c', '.'],
+                            stdout=subprocess.PIPE)
+    try:
+        subprocess.run(ic_exec(name, 'tar', '-C', '/', '-x', '--no-overwrite-dir', '--keep-directory-symlink',
+                               user=None), stdin=pack.stdout, check=True)
+    finally:
+        pack.stdout.close()
+        packed = pack.wait()
+    if packed:
+        raise subprocess.CalledProcessError(packed, pack.args)
+
+
 def build_new_base():
     version, url, digest = runner_release(fetch_json(RUNNER_RELEASES))
     new = 'base-new'
@@ -751,6 +788,7 @@ def build_new_base():
         wait_ready(new, time.time() + 900, network=True)
         subprocess.run(ic_exec(new, 'env', f'RUNNER_URL={url}', f'RUNNER_SHA256={digest}', 'bash', '-s', user=None),
                        input=GUEST_SETUP.encode(), check=True)
+        push_guest_files(new)
         ic('stop', new)
         ic('config', 'set', new, f'user.coldbox.runner={version}')
         ic('snapshot', 'create', new, 'warm')
@@ -770,8 +808,11 @@ def status(_args):
             failures.append(text)
 
     check(Path('/dev/kvm').exists(), 'hardware virtualization (/dev/kvm)', 'enable VT-x/AMD-V in the BIOS')
-    check(subprocess.run(['gh', 'auth', 'status'], capture_output=True).returncode == 0, 'gh is logged in',
-          'gh auth login')
+    try:
+        gh_ok, gh_fix = subprocess.run(['gh', 'auth', 'status'], capture_output=True).returncode == 0, 'gh auth login'
+    except OSError:
+        gh_ok, gh_fix = False, 'sudo ./install.sh installs gh; then gh auth login'
+    check(gh_ok, 'gh is logged in', gh_fix)
     for timer in ('coldbox-reap.timer', 'coldbox-refresh.timer'):
         active = subprocess.run(['systemctl', 'is-active', '--quiet', timer]).returncode == 0
         check(active, f'{timer} is active', 'sudo ./install.sh')

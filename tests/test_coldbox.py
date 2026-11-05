@@ -130,6 +130,75 @@ class Checks(unittest.TestCase):
         root = repo({'coldbox.toml': '[commands]\ntest = "false | cat"\n'})
         self.assertEqual(quiet(cb.run_checks, root, None)[0], 1)
 
+    def test_on_github_each_failure_and_failed_test_is_an_error_annotation(self):
+        fake = ("import os, re, pathlib, sys\n"
+                "path = pathlib.Path(re.search(r'--junitxml=(\\S+)', os.environ['PYTEST_ADDOPTS'])[1])\n"
+                "path.parent.mkdir(parents=True, exist_ok=True)\n"
+                f"path.write_text({JUNIT!r})\n"
+                "sys.exit(1)\n")
+        root = repo({'fake_pytest.py': fake,
+                     'coldbox.toml': '[checks]\nlint = false\n[commands]\nsetup = "true"\ntest = "python3 fake_pytest.py"\n'})
+        with mock.patch.dict(os.environ, GITHUB_ACTIONS='true'):
+            _, output = quiet(cb.run_checks, root, Path(tempfile.mkdtemp()) / 'checks.json')
+        self.assertEqual([line for line in output.splitlines() if line.startswith('::error')],
+                         ['::error title=coldbox 2 test(s) failed::tests.test_a.test_bad, tests.test_a.test_boom',
+                          '::error title=coldbox test failed::python3 fake_pytest.py exited 1'])
+        with mock.patch.dict(os.environ, GITHUB_ACTIONS='true'):
+            _, output = quiet(cb.run_checks, repo({'README.md': ''}), None)
+        self.assertIn('::error title=coldbox found nothing to run::', output)
+        with mock.patch.dict(os.environ):
+            os.environ.pop('GITHUB_ACTIONS', None)
+            _, output = quiet(cb.run_checks, root, Path(tempfile.mkdtemp()) / 'checks.json')
+        self.assertNotIn('::error', output)
+
+
+    def test_failed_test_annotation_counts_past_the_result_limit_and_ignores_earlier_runs(self):
+        cases = '<testcase classname="t" name="ok"/>' * cb.MAX_TEST_RESULTS + '<testcase classname="t" name="late"><failure/></testcase>'
+        fake = ("import os, re, pathlib, sys\n"
+                "path = pathlib.Path(re.search(r'--junitxml=(\\S+)', os.environ['PYTEST_ADDOPTS'])[1])\n"
+                "path.parent.mkdir(parents=True, exist_ok=True)\n"
+                f"path.write_text({'<testsuite name=\"s\">' + cases + '</testsuite>'!r})\n"
+                "sys.exit(1)\n")
+        root = repo({'fake_pytest.py': fake, 'coldbox.toml': '[checks]\nlint = false\n[commands]\ntest = "python3 fake_pytest.py"\n'})
+        job = Path(tempfile.mkdtemp())
+
+        def checks():
+            env = dict(os.environ, GITHUB_ACTIONS='true', COLDBOX_JOB_DIR=str(job))
+            output = subprocess.run([sys.executable, str(ROOT / 'coldbox'), 'checks', str(root)], env=env,
+                                    capture_output=True, text=True).stdout
+            return [line for line in output.splitlines() if line.startswith('::error')]
+
+        self.assertEqual(checks(), ['::error title=coldbox 1 test(s) failed::...',
+                                    '::error title=coldbox test failed::python3 fake_pytest.py exited 1'])
+        (root / 'coldbox.toml').write_text('[checks]\nlint = false\n[commands]\ntest = "true"\n')
+        self.assertEqual(checks(), [])
+
+
+class InstallOptions(unittest.TestCase):
+    def install(self, *args):
+        return subprocess.run(['bash', str(ROOT / 'install.sh'), *args], capture_output=True, text=True,
+                              env={'PATH': os.environ['PATH']})
+
+    def test_bad_size_options_are_refused_before_anything_is_installed(self):
+        for args, message in ((['--cpus', '0'], '--cpus must be a whole number'),
+                              (['--memory', '8'], '--memory must be a size'),
+                              (['--disk', 'big'], '--disk must be a size'),
+                              (['--memory', ''], '--memory must be a size'),
+                              (['--cpus'], '--cpus needs a value'),
+                              (['--slots', '2'], 'unknown option --slots')):
+            with self.subTest(args):
+                result = self.install(*args)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(message, result.stderr)
+
+    @unittest.skipIf(os.geteuid() == 0, 'would really install as root')
+    def test_good_size_options_and_existing_env_values_are_accepted(self):
+        result = self.install('--cpus', '4', '--memory', '8GiB', '--disk', '60GiB')
+        self.assertEqual((result.returncode, result.stderr), (1, 'coldbox install: run with sudo\n'))
+        result = subprocess.run(['bash', str(ROOT / 'install.sh')], capture_output=True, text=True,
+                                env={'PATH': os.environ['PATH'], 'COLDBOX_CPUS': '0-3'})
+        self.assertEqual((result.returncode, result.stderr), (1, 'coldbox install: run with sudo\n'))
+
 
 JUNIT = """<?xml version="1.0" encoding="utf-8"?>
 <testsuites><testsuite name="pytest" tests="4">
@@ -170,7 +239,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(tests['results'][1], dict(suite='pytest', classname='tests.test_a', name='test_bad',
                                                    status='failed', seconds=0.02))
         self.assertIsNone(tests['results'][2]['seconds'])
-        self.assertEqual((root / 'addopts.txt').read_text(), f"-p no:cacheprovider --junitxml={job / 'junit' / '0.xml'}")
+        self.assertEqual((root / 'addopts.txt').read_text(), f"-p no:cacheprovider --junitxml={job / 'junit' / str(os.getpid()) / '0.xml'}")
 
     def test_junit_command_finds_reports_and_ignores_other_xml(self):
         top = repo({'build/report.xml': JUNIT, 'pom.xml': '<project/>', 'bad.xml': '<testsuite><testcase',
@@ -499,7 +568,7 @@ class BuildBase(unittest.TestCase):
         import threading
         state = Path(tempfile.mkdtemp())
         calls = []
-        with mock.patch.multiple(cb, STATE=state, fetch_json=lambda url: None,
+        with mock.patch.multiple(cb, STATE=state, GUEST_FILES=state / 'no-guest-files', fetch_json=lambda url: None,
                                  runner_release=lambda _: ('2.340.0', 'u', 'd'), wait_ready=lambda *a, **k: None,
                                  destroy=lambda name: calls.append(('destroy', name)) or True,
                                  ic=lambda *a, **k: calls.append(a)), \
@@ -516,6 +585,71 @@ class BuildBase(unittest.TestCase):
             build.join(5)
         self.assertFalse(build.is_alive())
         self.assertIn(('move', 'base-new', 'base-dev'), calls)
+
+
+    def test_copies_guest_files_into_the_base_as_root(self):
+        import tarfile
+        tmp = Path(tempfile.mkdtemp())
+        files = tmp / 'guest'
+        (files / 'etc/coldbox').mkdir(parents=True)
+        (files / 'etc/coldbox/host').write_text('build-host\n')
+        (files / 'opt/tool').mkdir(parents=True)
+        (files / 'opt/tool/run').write_text('#!/bin/sh\n')
+        (files / 'opt/tool/run').chmod(0o755)
+        seen = []
+
+        def guest(name, *command, user):
+            seen.append((name, command, user))
+            return ['sh', '-c', f'cat > {tmp}/archive']
+        with mock.patch.multiple(cb, GUEST_FILES=files, ic_exec=guest):
+            cb.push_guest_files('base-new')
+        self.assertEqual(seen, [('base-new', ('tar', '-C', '/', '-x', '--no-overwrite-dir', '--keep-directory-symlink'), None)])
+        with tarfile.open(tmp / 'archive') as archive:
+            members = {m.name: m for m in archive.getmembers()}
+            self.assertEqual(archive.extractfile('./etc/coldbox/host').read(), b'build-host\n')
+        self.assertEqual({(m.uid, m.gid) for m in members.values()}, {(0, 0)})
+        self.assertEqual(members['./opt/tool/run'].mode & 0o777, 0o755)
+
+    def test_guest_files_keep_the_vms_directory_symlinks(self):
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / 'guest/bin').mkdir(parents=True)
+        (tmp / 'guest/bin/tool').write_text('#!/bin/sh\n')
+        vm = tmp / 'vm'
+        (vm / 'usr/bin').mkdir(parents=True)
+        (vm / 'usr/bin/sh').write_text('')
+        (vm / 'bin').symlink_to('usr/bin')
+        with mock.patch.multiple(cb, GUEST_FILES=tmp / 'guest',
+                                 ic_exec=lambda name, *command, user: [str(vm) if c == '/' else c for c in command]):
+            cb.push_guest_files('base-new')
+        self.assertTrue((vm / 'bin').is_symlink())
+        self.assertEqual(sorted(p.name for p in (vm / 'usr/bin').iterdir()), ['sh', 'tool'])
+
+    @unittest.skipIf(os.geteuid() == 0, 'root can read any file')
+    def test_unreadable_guest_files_fail_the_build(self):
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / 'guest').mkdir()
+        (tmp / 'guest/secret').write_text('x')
+        (tmp / 'guest/secret').chmod(0)
+        with mock.patch.multiple(cb, GUEST_FILES=tmp / 'guest',
+                                 ic_exec=lambda name, *command, user: ['sh', '-c', f'cat > {tmp}/archive']):
+            with self.assertRaises(subprocess.CalledProcessError):
+                quiet(cb.push_guest_files, 'base-new')
+
+    def test_no_guest_files_means_no_copy(self):
+        with mock.patch.multiple(cb, GUEST_FILES=Path(tempfile.mkdtemp()) / 'missing'), \
+                mock.patch.object(cb.subprocess, 'run') as run:
+            cb.push_guest_files('base-new')
+        run.assert_not_called()
+
+    def test_guest_files_land_before_the_snapshot(self):
+        calls = []
+        with mock.patch.multiple(cb, fetch_json=lambda url: None, runner_release=lambda _: ('2.340.0', 'u', 'd'),
+                                 wait_ready=lambda *a, **k: None, destroy=lambda name: True,
+                                 push_guest_files=lambda name: calls.append(('guest-files', name)),
+                                 ic=lambda *a, **k: calls.append(a)), \
+                mock.patch.object(cb.subprocess, 'run'):
+            cb.build_new_base()
+        self.assertLess(calls.index(('guest-files', 'base-new')), calls.index(('stop', 'base-new')))
 
 
 class Unregister(unittest.TestCase):
@@ -545,6 +679,18 @@ class Unregister(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         deleted = [line.split('/')[-1] for line in (tmp / 'calls').read_text().splitlines() if 'DELETE' in line]
         self.assertEqual(deleted, [str(i) for i in range(101)])
+
+
+class Status(unittest.TestCase):
+    def test_a_host_without_gh_or_incus_gets_failures_not_a_crash(self):
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / 'systemctl').write_text('#!/bin/sh\nexit 3\n')
+        (tmp / 'systemctl').chmod(0o755)
+        with mock.patch.dict(os.environ, PATH=str(tmp)), mock.patch.object(cb, 'STATE', tmp):
+            code, output = quiet(cb.status, None)
+        self.assertEqual(code, 1)
+        self.assertIn('FAIL  gh is logged in', output)
+        self.assertIn('FAIL  Coldbox is installed', output)
 
 
 class Sizes(unittest.TestCase):
