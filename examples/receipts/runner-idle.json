@@ -1,0 +1,24 @@
+{
+  "schema": "coldbox.receipt/v1",
+  "id": "cbx-1793991089-3df0ad",
+  "mode": "runner",
+  "repo": "TayHCode/example-repo",
+  "sha": null,
+  "verdict": "idle",
+  "checks": [],
+  "started_at": "2026-11-06T18:51:30+00:00",
+  "log": "/var/lib/coldbox/receipts/cbx-1793991089-3df0ad.log",
+  "runner_id": 93,
+  "vm": {
+    "name": "cbx-1793991089-3df0ad",
+    "image": "base-dev/warm",
+    "ttl_seconds": 21600,
+    "offline": false,
+    "destroyed": true,
+    "ready_seconds": 40.465,
+    "destroyed_at": "2026-11-06T18:54:14+00:00",
+    "lifetime_seconds": 163.771
+  },
+  "error": "stopped",
+  "seconds": 163.771
+}

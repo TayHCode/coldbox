@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Coldbox: run CI checks in one throwaway Incus VM per job."""
 import argparse
+import collections
 import fcntl
 import grp
 import ipaddress
@@ -14,28 +15,42 @@ import signal
 import subprocess
 import sys
 import time
+import threading
 import tomllib
+import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 
-PROJECT = 'coldbox'
+VERSION = '0.1.0'
+INCUS_ENV = Path(os.environ.get('COLDBOX_INCUS_ENV', '/etc/coldbox/incus.env'))
+INCUS = dict(COLDBOX_NAME_PREFIX='coldbox', COLDBOX_SUBNET='10.204.0.1/24')
+if INCUS_ENV.is_file():
+    INCUS.update(line.split('=', 1) for line in INCUS_ENV.read_text().splitlines() if '=' in line)
+PROJECT = POOL = INCUS['COLDBOX_NAME_PREFIX']
+BRIDGE = f'{PROJECT}br0'
+NETWORK_ACL = f'{PROJECT}-isolated'
+GATEWAY = INCUS['COLDBOX_SUBNET'].split('/')[0]
 BASE = 'base-dev/warm'
 IMAGE = 'images:ubuntu/26.04/cloud'
 RUNNER_RELEASES = 'https://api.github.com/repos/actions/runner/releases/latest'
 UNITS = {'': 1, 'B': 1, 'KB': 10**3, 'MB': 10**6, 'GB': 10**9, 'TB': 10**12,
          'KiB': 2**10, 'MiB': 2**20, 'GiB': 2**30, 'TiB': 2**40}
 HOST_RESERVE = 2 * 2**30
-INCUS_COMMANDS = {'run', 'serve', 'register', 'reap', 'status'}
-GATEWAY = '10.204.0.1'
+INCUS_COMMANDS = {'run', 'serve', 'register', 'reap', 'status', 'vm'}
+ADHOC = 'user.coldbox.adhoc'
 STATE = Path(os.environ.get('COLDBOX_STATE', '/var/lib/coldbox'))
 GUEST_JOB_DIR = '/var/lib/coldbox/job'
 GUEST_FILES = Path('/etc/coldbox/guest')
+HOST_CHECKS = Path(os.environ.get('COLDBOX_HOST_CHECKS', '/etc/coldbox/checks.toml'))
+STANDBY = Path(os.environ.get('COLDBOX_STANDBY', '/etc/coldbox/standby'))
+CPUS = Path('/sys/devices/system/cpu')
 RUNNER = 'runner'
 SAME_REPO_EVENTS = {'push', 'workflow_dispatch', 'schedule', 'repository_dispatch', 'release', 'create', 'delete'}
 JUNIT_DIRS = dict(local=[f'{GUEST_JOB_DIR}/junit', f'/home/{RUNNER}/repo'],
-                  runner=[f'{GUEST_JOB_DIR}/junit', '/opt/actions-runner/_work'])
+                  runner=[f'{GUEST_JOB_DIR}/junit', '/opt/actions-runner/_work'],
+                  adhoc=[f'{GUEST_JOB_DIR}/junit'])
 JUNIT_STATUS = (('failure', 'failed'), ('error', 'error'), ('skipped', 'skipped'))
 MAX_TEST_RESULTS = 5000
 JOB_STARTED = f'{GUEST_JOB_DIR}/started'
@@ -43,6 +58,15 @@ ARCHIVED = f'{GUEST_JOB_DIR}/archived'
 PYTEST_CONFIGS = ('pytest.ini', 'pyproject.toml', 'setup.cfg', 'tox.ini')
 LABELS = ['self-hosted', 'linux', 'x64', 'coldbox']
 CHECK_ORDER = ['setup', 'lint', 'test', 'verify']
+RECIPE = '.fleet/verify.sh'
+AUTOSCALE_SECONDS = 30
+BURST_IDLE_SECONDS = 600
+STARTING_SECONDS = 180
+QUOTA_RESERVE = 500
+IDLE_RELEASED = 'no job before the burst idle limit'
+CLEANUP = threading.Event()
+STOPPING = threading.Event()
+IDLE_UNIT = {'inactive', 'failed'}
 NAME = re.compile(r'[a-z][a-z0-9_-]*')
 RAN_A_TEST = " 2>&1 | awk '{{print}} /{}/{{ok=1}} END{{exit !ok}}' || {{ echo 'coldbox: no passing test in the output' >&2; exit 1; }}"
 GO_TEST = 'go test -v ./...' + RAN_A_TEST.format(r'^[ \t]*--- PASS')
@@ -78,11 +102,11 @@ def size_bytes(text):
     return int(float(match[1]) * UNITS[match[2] or ''])
 
 
-def host_memory():
+def host_memory(field='MemTotal'):
     for line in Path('/proc/meminfo').read_text().splitlines():
-        if line.startswith('MemTotal:'):
+        if line.startswith(f'{field}:'):
             return int(line.split()[1]) * 1024
-    raise RuntimeError('MemTotal missing from /proc/meminfo')
+    raise RuntimeError(f'{field} missing from /proc/meminfo')
 
 
 def fits(slots, vm_memory, host):
@@ -142,43 +166,50 @@ def detect(root):
             add('test', CARGO_TEST)
     if files('*.sh'):
         add('lint', "find . -name '*.sh' -not -path '*/.*' -not -path '*/node_modules/*' -print0 | xargs -0 shellcheck")
-    if has('verify.sh'):
-        add('verify', 'bash verify.sh')
+    if has(RECIPE):
+        add('verify', 'coldverify --ci')
     return found
 
 
-def load_config(root):
-    path = Path(root) / 'coldbox.toml'
+def load_config(path, label='coldbox.toml'):
     if not path.exists():
         return {}, {}
     try:
         data = tomllib.loads(path.read_text())
     except tomllib.TOMLDecodeError as error:
-        raise ConfigError(f'coldbox.toml: {error}')
+        raise ConfigError(f'{label}: {error}')
     unknown = set(data) - {'checks', 'commands'}
     if unknown:
-        raise ConfigError(f'coldbox.toml: unknown section {sorted(unknown)[0]!r}; use [checks] and [commands]')
+        raise ConfigError(f'{label}: unknown section {sorted(unknown)[0]!r}; use [checks] and [commands]')
     switches, commands = data.get('checks', {}), data.get('commands', {})
     for section, table, kind in (('checks', switches, bool), ('commands', commands, str)):
         if not isinstance(table, dict):
-            raise ConfigError(f'coldbox.toml: [{section}] must be a table')
+            raise ConfigError(f'{label}: [{section}] must be a table')
         for name, value in table.items():
             if not NAME.fullmatch(name):
-                raise ConfigError(f'coldbox.toml: bad check name {name!r} in [{section}]')
+                raise ConfigError(f'{label}: bad check name {name!r} in [{section}]')
             if type(value) is not kind or (kind is str and not value.strip()):
-                raise ConfigError(f'coldbox.toml: [{section}] {name} must be {"true or false" if kind is bool else "a command string"}')
+                raise ConfigError(f'{label}: [{section}] {name} must be {"true or false" if kind is bool else "a command string"}')
     return switches, commands
 
 
+def host_switches():
+    switches, commands = load_config(HOST_CHECKS, str(HOST_CHECKS))
+    if commands:
+        raise ConfigError(f'{HOST_CHECKS}: only [checks] belongs here; put [commands] in the repo coldbox.toml')
+    return switches
+
+
 def plan(root):
-    switches, overrides = load_config(root)
+    host = host_switches()
+    switches, overrides = load_config(Path(root) / 'coldbox.toml')
     found = detect(root)
     found.update({name: [command] for name, command in overrides.items()})
     missing = [name for name, on in switches.items() if on and name not in found]
     if missing:
         raise ConfigError(f'coldbox.toml: check {missing[0]!r} is on but nothing was detected; add it under [commands]')
     names = [n for n in CHECK_ORDER if n in found] + [n for n in found if n not in CHECK_ORDER]
-    return [(name, found[name]) for name in names if switches.get(name, True)]
+    return [(name, found[name]) for name in names if switches.get(name, host.get(name, True))]
 
 
 def run_checks(root, out=None):
@@ -347,7 +378,7 @@ def host_addresses():
 
 
 def sync_acl():
-    subprocess.run(['incus', '--force-local', 'network', 'acl', 'edit', 'coldbox-isolated'],
+    subprocess.run(['incus', '--force-local', 'network', 'acl', 'edit', NETWORK_ACL],
                    input=json.dumps(acl_document(host_addresses())), check=True, capture_output=True, text=True)
 
 
@@ -401,19 +432,38 @@ def isolated(name, offline):
         problems.append('root disk is not a plain pool volume')
     if offline and nic.get('type') != 'none':
         problems.append('offline VM still has a NIC')
-    if not offline and (nic.get('type') != 'nic' or nic.get('network') != 'coldboxbr0'
+    if not offline and (nic.get('type') != 'nic' or nic.get('network') != BRIDGE
                         or nic.get('security.port_isolation') != 'true'):
-        problems.append('NIC is not on the isolated coldboxbr0 bridge')
+        problems.append(f'NIC is not on the isolated {BRIDGE} bridge')
     if any(key.startswith('raw.') for key in config):
         problems.append('raw.* config present')
     if problems:
         raise RuntimeError('Refusing unsafe VM: ' + '; '.join(problems))
 
 
-def wait_ready(name, expires, network):
+BOOT_SECONDS = 300
+STOPPED_SECONDS = 30
+
+
+def wait_ready(name, expires, network, restarts=3):
+    boot_deadline = time.time() + BOOT_SECONDS
+    stopped_since = None
     while subprocess.run(ic_exec(name, 'true', user=None, timeout=10), capture_output=True).returncode:
         if time.time() > expires:
             raise RuntimeError('VM agent not ready before TTL')
+        if query(f'/1.0/instances/{name}?project={PROJECT}')['status'] != 'Stopped':
+            stopped_since = None
+        elif stopped_since is None:
+            stopped_since = time.time()
+        if (stopped_since is not None and time.time() - stopped_since > STOPPED_SECONDS) or time.time() > boot_deadline:
+            stopped_since = None
+            if not restarts:
+                raise RuntimeError('VM agent not ready after restarts')
+            restarts -= 1
+            subprocess.run(['incus', '--force-local', '--project', PROJECT, 'stop', name, '--force'],
+                           capture_output=True)
+            subprocess.run(['incus', '--force-local', '--project', PROJECT, 'start', name], capture_output=True)
+            boot_deadline = time.time() + BOOT_SECONDS
         time.sleep(1)
     if network:
         code = subprocess.run(ic_exec(name, 'cloud-init', 'status', '--wait', user=None,
@@ -428,35 +478,47 @@ def pull(name, path):
     return json.loads(result.stdout) if result.returncode == 0 and result.stdout.strip() else None
 
 
-def destroy(name):
-    subprocess.run(['incus', '--force-local', '--project', PROJECT, 'delete', name, '--force'], capture_output=True)
-    info = subprocess.run(['incus', '--force-local', '--project', PROJECT, 'info', name], capture_output=True)
-    return info.returncode != 0 and b'Instance not found' in info.stderr
+def destroy(name, attempts=3):
+    for attempt in range(attempts):
+        if attempt:
+            time.sleep(5)
+        subprocess.run(['incus', '--force-local', '--project', PROJECT, 'delete', name, '--force'], capture_output=True)
+        info = subprocess.run(['incus', '--force-local', '--project', PROJECT, 'info', name], capture_output=True)
+        if info.returncode != 0 and b'Instance not found' in info.stderr:
+            return True
+    return False
+
+
+def boot(name, expires, offline, *config):
+    sync_acl()
+    ic('copy', BASE, name, '--config', f'user.coldbox.expires={expires}', *config)
+    if offline:
+        ic('config', 'device', 'add', name, 'eth0', 'none')
+    isolated(name, offline)
+    ic('start', name)
+    wait_ready(name, expires, network=not offline)
 
 
 def job(mode, name, ttl, command, repo, sha=None, stdin=None, archive=None, offline=False, cwd=None, env=(),
-        extra=None):
-    receipts = STATE / 'receipts'
+        extra=None, receipts=None):
+    CLEANUP.clear()
+    receipts = Path(receipts or STATE / 'receipts')
     receipts.mkdir(parents=True, exist_ok=True)
     path, log_path = receipts / f'{name}.json', receipts / f'{name}.log'
     started = time.time()
     expires = int(started + ttl)
     receipt = dict(schema='coldbox.receipt/v1', id=name, mode=mode, repo=repo, sha=sha, verdict='incomplete',
-                   checks=[], started_at=now_iso(), log=str(log_path), **(extra or {}),
+                   host=os.uname().nodename, checks=[], started_at=now_iso(), log=str(log_path), **(extra or {}),
                    vm=dict(name=name, image=BASE, ttl_seconds=ttl, offline=offline, destroyed=False))
     write_json(path, receipt)
     guest_env = [f'COLDBOX_JOB_DIR={GUEST_JOB_DIR}', 'PIP_BREAK_SYSTEM_PACKAGES=1', *env]
     with log_path.open('ab') as log:
         try:
-            sync_acl()
-            ic('copy', BASE, name, '--config', f'user.coldbox.expires={expires}')
-            if offline:
-                ic('config', 'device', 'add', name, 'eth0', 'none')
-            isolated(name, offline)
-            ic('start', name)
-            wait_ready(name, expires, network=not offline)
+            boot(name, expires, offline)
             receipt['vm']['ready_seconds'] = round(time.time() - started, 3)
             ic('file', 'push', str(Path(__file__).resolve()), f'{name}/usr/local/bin/coldbox', '--mode', '0755')
+            if HOST_CHECKS.exists():
+                ic('file', 'push', str(HOST_CHECKS), f'{name}{HOST_CHECKS}', '--create-dirs', '--mode', '0644')
             if archive is not None:
                 extract = f'mkdir -p ~/repo && tar -x -v -C ~/repo | sed "s|^|$HOME/repo/|" > {ARCHIVED}'
                 subprocess.run(ic_exec(name, 'bash', '-o', 'pipefail', '-c', extract), input=archive,
@@ -488,8 +550,11 @@ def job(mode, name, ttl, command, repo, sha=None, stdin=None, archive=None, offl
             receipt['error'] = str(error)
         except (SystemExit, KeyboardInterrupt):
             receipt['error'] = 'stopped'
+            if mode == 'runner' and (assigned := running_job(log_path.read_bytes())):
+                receipt['job_name'] = assigned
             raise
         finally:
+            CLEANUP.set()
             gone = destroy(name)
             ended = time.time()
             receipt['vm'].update(destroyed=gone, destroyed_at=now_iso(), lifetime_seconds=round(ended - started, 3))
@@ -505,6 +570,11 @@ def job_outcome(log):
     return tuple(part.decode(errors='replace') for part in found[-1]) if found else (None, None)
 
 
+def running_job(log):
+    found = re.findall(rb'Running job: (.+)', log)
+    return found[-1].decode(errors='replace').strip() if found else None
+
+
 def verdict(receipt):
     if not receipt['vm']['destroyed']:
         return 'incomplete'
@@ -513,12 +583,18 @@ def verdict(receipt):
     if receipt.get('checks_verdict') == 'fail' or receipt.get('job_result') == 'Failed':
         return 'fail'
     if receipt.get('error'):
-        idle = receipt['mode'] == 'runner' and 'github' not in receipt and receipt['error'] == 'TTL reached'
+        idle = (receipt['mode'] == 'runner' and 'github' not in receipt and not receipt.get('job_name')
+                and receipt['error'] in ('TTL reached', IDLE_RELEASED, 'stopped'))
         return 'idle' if idle else 'incomplete'
-    if receipt['mode'] == 'runner' and receipt.get('job_result') == 'Succeeded' and receipt.get('github'):
-        return 'pass'
+    if receipt['mode'] == 'runner' and receipt.get('github'):
+        if receipt.get('job_result') == 'Succeeded':
+            return 'pass'
+        if receipt.get('job_result') == 'Canceled':
+            return 'canceled'
     if receipt['mode'] == 'local' and receipt.get('checks_verdict') == 'pass' and receipt.get('exit') == 0:
         return 'pass'
+    if receipt['mode'] == 'adhoc' and 'exit' in receipt:
+        return 'pass' if receipt['exit'] == 0 else 'fail'
     return 'incomplete'
 
 
@@ -534,10 +610,59 @@ def run_local(args):
     if git(path, 'status', '--porcelain', '--', 'coldbox.toml').strip():
         raise SystemExit('coldbox: commit coldbox.toml first; the VM runs the committed HEAD')
     plan(path)
-    receipt = job('local', new_id(), args.ttl, ['coldbox', 'checks'], repo=match[1] if match else path.name,
+    name = new_id()
+    if not admit(match[1] if match else path.name, name, 'once'):
+        raise SystemExit('coldbox: the host is at its job VM ceiling; try again when a job finishes')
+    receipt = job('local', name, args.ttl, ['coldbox', 'checks'], repo=match[1] if match else path.name,
                   sha=sha, archive=git(path, 'archive', '--format=tar', 'HEAD'), offline=args.offline,
-                  cwd='/home/runner/repo')
+                  cwd='/home/runner/repo', receipts=args.receipts)
     return exit_code(receipt)
+
+
+def run_adhoc(args):
+    if args.path != '.':
+        raise SystemExit('coldbox: give a repo PATH or -- COMMAND, not both')
+    name = new_id()
+    if not admit('adhoc', name, 'once'):
+        raise SystemExit('coldbox: the host is at its job VM ceiling; try again when a job finishes')
+    receipt = job('adhoc', name, args.ttl, args.command, repo='adhoc', offline=args.offline, cwd=f'/home/{RUNNER}',
+                  extra=dict(command=args.command), receipts=args.receipts)
+    return 125 if 'error' in receipt or 'exit' not in receipt or not receipt['vm']['destroyed'] else receipt['exit']
+
+
+def adhoc_vms():
+    return {vm['name']: vm for vm in json.loads(ic('list', '--format', 'json'))
+            if vm['name'].startswith('cbx-') and (vm.get('config') or {}).get(ADHOC) == 'true'}
+
+
+def vm_cmd(args):
+    if args.action == 'up':
+        name = new_id()
+        if not admit('vm', name, 'vm'):
+            raise SystemExit('coldbox: the host is at its job VM ceiling; try again when a job finishes')
+        try:
+            boot(name, int(time.time() + args.ttl), args.offline, '--config', f'{ADHOC}=true')
+        except BaseException:
+            destroy(name)
+            raise
+        print(name)
+        return 0
+    vms = adhoc_vms()
+    if args.action == 'list':
+        for vm in vms.values():
+            left = int(vm['config'].get('user.coldbox.expires', 0)) - time.time()
+            print(f"{vm['name']}\t{vm['status']}\texpires in {max(0, left) / 60:.0f} min")
+        return 0
+    if args.name not in vms:
+        raise SystemExit(f'coldbox: no ad-hoc VM named {args.name}; see coldbox vm list')
+    if args.action == 'down':
+        gone = destroy(args.name)
+        print(f"coldbox: {args.name} {'deleted' if gone else 'FAILED to delete'}", file=sys.stderr)
+        return 0 if gone else 1
+    left = int(vms[args.name]['config']['user.coldbox.expires']) - time.time()
+    if left <= 0:
+        raise SystemExit(f'coldbox: {args.name} has expired; the reaper will delete it')
+    return subprocess.run(ic_exec(args.name, *args.command, cwd=f'/home/{RUNNER}', timeout=left)).returncode
 
 
 def gh(*args, body=None):
@@ -557,7 +682,10 @@ def scope(target):
 
 def guard(target, allow_public):
     if '/' in target:
-        public = gh(scope(target))['visibility'] != 'private'
+        repo = gh(scope(target))
+        if str(repo.get('full_name')).casefold() != target.casefold():
+            raise SystemExit(f"coldbox: refusing: {target} now resolves to {repo.get('full_name')}")
+        public = repo['visibility'] != 'private'
         what = f'{target} is not a private repository'
     else:
         public = gh(f'orgs/{target}/actions/runner-groups/1')['allows_public_repositories']
@@ -576,40 +704,88 @@ def exit_code(receipt):
     return {'pass': 0, 'fail': 1}.get(receipt['verdict'], 125)
 
 
+def worker_argv(args, *extra):
+    argv = [sys.executable, str(Path(__file__).resolve()), 'serve', args.target, '--worker', '--ttl', str(args.ttl)]
+    return argv + ['--allow-public'] * args.allow_public + ['--allow-forks'] * args.allow_forks + list(extra)
+
+
 def serve_slots(args):
-    argv = [sys.executable, str(Path(__file__).resolve()), 'serve', args.target, '--slots', '1', '--ttl', str(args.ttl)]
-    argv += ['--allow-public'] * args.allow_public + ['--allow-forks'] * args.allow_forks + ['--once'] * args.once
-    children = [subprocess.Popen(argv) for _ in range(args.slots)]
+    children = [subprocess.Popen(worker_argv(args, *['--once'] * args.once)) for _ in range(args.slots)]
+    bursts = []
+    STOPPING.clear()
     signal.signal(signal.SIGINT, signal.SIG_IGN)
-    signal.signal(signal.SIGTERM, lambda *_: [child.send_signal(signal.SIGTERM) for child in children])
+    signal.signal(signal.SIGTERM, lambda *_: [STOPPING.set()] + [child.send_signal(signal.SIGTERM)
+                                                               for child in children + bursts if child.poll() is None])
     if args.once:
         return max(child.wait() for child in children)
-    while all(child.poll() is None for child in children):
+    github = GitHub() if '/' in args.target else None
+    next_pass = 0
+    while not STOPPING.is_set() and all(child.poll() is None for child in children):
+        if github and time.time() >= next_pass:
+            next_pass = time.time() + AUTOSCALE_SECONDS
+            try:
+                autoscale(github, args, bursts)
+            except (OSError, RuntimeError, ValueError, KeyError, subprocess.SubprocessError) as error:
+                print(f'coldbox: autoscale pass failed: {type(error).__name__}: {error}', file=sys.stderr, flush=True)
         time.sleep(1)
-    for child in children:
+    for child in children + bursts:
         if child.poll() is None:
             child.send_signal(signal.SIGTERM)
-    return max(child.wait() for child in children) or 1
+    return max((child.wait() for child in children + bursts), default=143) or 1
+
+
+def release_idle(target, runner_id):
+    if CLEANUP.is_set():
+        return
+    try:
+        gh('-X', 'DELETE', f'{scope(target)}/actions/runners/{runner_id}')
+    except RuntimeError as error:
+        if 'HTTP 422' not in str(error):
+            retry = threading.Timer(60, release_idle, (target, runner_id))
+            retry.daemon = True
+            retry.start()
+        return
+    os.kill(os.getpid(), signal.SIGUSR1)
+
+
+def idle_released(*_):
+    if not CLEANUP.is_set():
+        raise RuntimeError(IDLE_RELEASED)
 
 
 def serve(args):
-    if args.slots > 1:
+    if not args.worker and (args.slots > 1 or not args.once):
         return serve_slots(args)
     signal.signal(signal.SIGTERM, stop_once)
+    signal.signal(signal.SIGUSR1, idle_released)
     env = ['ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/coldbox-job-started.sh']
     if args.allow_forks:
         env.append('COLDBOX_ALLOW_FORKS=1')
     while True:
         guard(args.target, args.allow_public)
-        name = new_id()
+        name = args.name or new_id()
+        if args.idle:
+            note_worker(os.getpid(), args.target, name, 'burst')
+        elif not admit(args.target, name, 'base' if args.worker and not args.once else 'once'):
+            if args.once:
+                raise SystemExit('coldbox: the host is at its job VM ceiling; not starting another')
+            print('coldbox: the host is at its job VM ceiling; waiting', file=sys.stderr, flush=True)
+            time.sleep(30)
+            continue
         runner = gh('-X', 'POST', f'{scope(args.target)}/actions/runners/generate-jitconfig',
                     body=dict(name=name, runner_group_id=1, labels=LABELS, work_folder='_work'))
+        idle = threading.Timer(args.idle, release_idle, (args.target, runner['runner']['id'])) if args.idle else None
         try:
+            if idle:
+                idle.daemon = True
+                idle.start()
             print(f'coldbox: runner {name} waiting for a job on {args.target}', file=sys.stderr, flush=True)
             receipt = job('runner', name, args.ttl, ['sh', '-c', 'read -r c; exec ./run.sh --jitconfig "$c"'],
                           repo=args.target, stdin=(runner['encoded_jit_config'] + '\n').encode(),
                           cwd='/opt/actions-runner', env=env, extra=dict(runner_id=runner['runner']['id']))
         finally:
+            if idle:
+                idle.cancel()
             try:
                 gh('-X', 'DELETE', f"{scope(args.target)}/actions/runners/{runner['runner']['id']}")
             except RuntimeError:
@@ -618,6 +794,236 @@ def serve(args):
             return exit_code(receipt)
         if 'job_seconds' not in receipt:
             time.sleep(30)
+
+
+class GitHub:
+    def __init__(self):
+        self.cache, self.used = {}, set()
+        self.remaining, self.reset = None, 0
+
+    def get(self, path):
+        if self.remaining is not None and self.remaining < QUOTA_RESERVE and time.time() < self.reset:
+            raise RuntimeError(f'GitHub API quota low ({self.remaining} left); waiting for its reset')
+        token = subprocess.run(['gh', 'auth', 'token'], capture_output=True, text=True, check=True,
+                               timeout=60).stdout.strip()
+        headers = {'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.github+json',
+                   'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'coldbox'}
+        self.used.add(path)
+        if path in self.cache:
+            headers['If-None-Match'] = self.cache[path][0]
+        request = urllib.request.Request(f'https://api.github.com/{path}', headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                self.note(response.headers)
+                value = json.loads(response.read())
+                if response.headers.get('ETag'):
+                    self.cache[path] = (response.headers['ETag'], value)
+                return value
+        except urllib.error.HTTPError as error:
+            self.note(error.headers)
+            if error.code == 304 and path in self.cache:
+                return self.cache[path][1]
+            raise RuntimeError(f'GET {path}: HTTP {error.code}') from None
+
+    def note(self, headers):
+        if headers and headers.get('X-RateLimit-Remaining') is not None:
+            self.remaining = int(headers['X-RateLimit-Remaining'])
+            self.reset = int(headers.get('X-RateLimit-Reset', 0))
+
+    def forget_unused(self):
+        self.cache = {path: entry for path, entry in self.cache.items() if path in self.used}
+        self.used = set()
+
+
+def listing(github, path, key):
+    items, page = [], 1
+    while True:
+        batch = github.get(f'{path}per_page=100&page={page}')[key]
+        items += batch
+        if len(batch) < 100:
+            return items
+        page += 1
+
+
+def runs_here(labels):
+    return bool(labels) and {label.casefold() for label in labels} <= set(LABELS)
+
+
+def queued_jobs(github, repo, older_than=0):
+    runs = [run for status in ('queued', 'in_progress')
+            for run in listing(github, f'repos/{repo}/actions/runs?status={status}&', 'workflow_runs')]
+    cutoff = time.time() - older_than
+    return sum(job['status'] == 'queued' and runs_here(job['labels']) and (not older_than or queued_at(job) <= cutoff)
+               for run in runs for job in listing(github, f"repos/{repo}/actions/runs/{run['id']}/jobs?", 'jobs'))
+
+
+def queued_at(job):
+    return datetime.fromisoformat(job['created_at'][:19]).replace(tzinfo=timezone.utc).timestamp()
+
+
+def standby_seconds():
+    try:
+        text = STANDBY.read_text().strip()
+    except FileNotFoundError:
+        return 0
+    if not text.isdigit():
+        raise ValueError(f'{STANDBY} must hold a whole number of seconds, not {text!r}')
+    return int(text)
+
+
+def burst_count(wanted, running, cpus, cores, load, available, total, vm_memory):
+    """How many burst VMs to start: one per queued job, within a ceiling of one VM per CPU thread and per VM-sized
+    share of RAM, and only while physical cores are free and RAM is available now."""
+    ceiling = min(cpus, (total - HOST_RESERVE) // vm_memory)
+    room = min(ceiling - running, int(cores - load), (available - HOST_RESERVE) // vm_memory)
+    return max(0, min(wanted, room))
+
+
+def physical_cores():
+    try:
+        online = (CPUS / 'online').read_text().strip()
+    except FileNotFoundError:
+        return os.cpu_count() or 1
+    if not re.fullmatch(r'\d+(-\d+)?(,\d+(-\d+)?)*', online):
+        raise ValueError(f'{CPUS / "online"} is not a CPU list: {online!r}')
+    ranges = [(int(first), int(last or first)) for first, _, last in (part.partition('-') for part in online.split(','))]
+    if any(last < first for first, last in ranges):
+        raise ValueError(f'{CPUS / "online"} has a reversed range: {online!r}')
+    cpus = [cpu for first, last in ranges for cpu in range(first, last + 1)]
+    try:
+        return len({(CPUS / f'cpu{cpu}' / 'topology' / 'core_cpus_list').read_text() for cpu in cpus})
+    except FileNotFoundError:
+        return len(cpus)
+
+
+def process_start(pid):
+    try:
+        return Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def live_workers(folder):
+    live = []
+    for record in folder.glob('[0-9]*'):
+        try:
+            target, start, name, kind = json.loads(record.read_text())
+        except (OSError, ValueError, TypeError):
+            start = None
+        if start and process_start(record.name) == start:
+            live.append(argparse.Namespace(pid=int(record.name), target=target, name=name, kind=kind))
+        else:
+            record.unlink(missing_ok=True)
+    return live
+
+
+def note_worker(pid, target, name, kind):
+    folder = STATE / 'workers'
+    folder.mkdir(parents=True, exist_ok=True)
+    staged = folder / f'.{pid}.{os.getpid()}'
+    staged.write_text(json.dumps([target, process_start(pid), name, kind]))
+    os.replace(staged, folder / str(pid))
+
+
+def host_vms():
+    return {vm['name'] for vm in json.loads(ic('list', '--format', 'json')) if vm['name'].startswith('cbx-')}
+
+
+def host_load(workers, skip=None):
+    vms = host_vms()
+    orphans = len(vms - {worker.name for worker in workers})
+    counted = [worker for worker in workers if not (worker.target == skip and worker.kind == 'base')]
+    started = collections.Counter(worker.target for worker in workers if worker.kind == 'base')
+    pending = sum(max(0, r['slots'] - started[r['target']]) for r in registrations()
+                  if (r.get('configured') or r['active'] not in IDLE_UNIT) and r['target'] != skip)
+    return orphans + len(counted) + pending
+
+
+def additional_vm_memory(workers, memory):
+    owned = host_vms() | {worker.name for worker in workers}
+    committed = 0
+    for vm in query('/1.0/instances?recursion=1&all-projects=true'):
+        if vm['type'] != 'virtual-machine' or vm['status'] != 'Running':
+            continue
+        counted = memory if vm['project'] == PROJECT and vm['name'] in owned else 0
+        limit = (vm.get('expanded_config') or {}).get('limits.memory') or (vm.get('config') or {}).get('limits.memory')
+        committed += max(0, (size_bytes(limit) if limit else memory) - counted)
+    return committed
+
+
+def admit(target, name, kind):
+    me = argparse.Namespace(pid=os.getpid(), target=target, name=name, kind=kind)
+    with host_lock():
+        workers = [worker for worker in live_workers(STATE / 'workers') if worker.pid != me.pid] + [me]
+        memory = vm_memory()
+        available = host_memory() - HOST_RESERVE - additional_vm_memory(workers, memory)
+        if host_load(workers) > min(os.cpu_count(), available // memory):
+            return False
+        note_worker(me.pid, target, name, kind)
+        return True
+
+
+def host_lock():
+    STATE.mkdir(parents=True, exist_ok=True)
+    lock = os.fdopen(os.open(STATE / 'autoscale.lock', os.O_RDONLY | os.O_CREAT, 0o644))
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    return lock
+
+
+def starting(name, now):
+    try:
+        return now - int(name.split('-')[1]) < STARTING_SECONDS
+    except (IndexError, ValueError):
+        return False
+
+
+def free_runners(runners, bursts, now):
+    """Runners that can still take a queued job: online and idle, starting up, or a burst not yet on GitHub."""
+    listed = {runner['name'] for runner in runners}
+    free = sum(runner['name'].startswith('cbx-') and not runner['busy']
+               and (runner['status'] == 'online' or starting(runner['name'], now)) for runner in runners)
+    return free + sum(burst.name not in listed and starting(burst.name, now) for burst in bursts)
+
+
+def autoscale(github, args, bursts):
+    folder = STATE / 'workers'
+    finished = [burst for burst in bursts if burst.poll() is not None]
+    if finished:
+        bursts[:] = [burst for burst in bursts if burst not in finished]
+        with host_lock():
+            live_workers(folder)
+    repo = github.get(f'repos/{args.target}')
+    if repo['full_name'].casefold() != args.target.casefold() or repo['visibility'] != 'private' and not args.allow_public:
+        raise ValueError(f"{args.target} now resolves to {repo['visibility']} {repo['full_name']}; not scaling it")
+    standby, seen = standby_seconds(), queued_jobs(github, args.target)
+    queued = queued_jobs(github, args.target, standby) if standby and seen else seen
+    idle = 0
+    if queued:
+        runners = listing(github, f'repos/{args.target}/actions/runners?', 'runners')
+        idle = free_runners(runners, bursts, time.time())
+    github.forget_unused()
+    if seen and not queued:
+        print(f'coldbox: standby host: {seen} job(s) on {args.target} queued under {standby} s are left to the '
+              'primary host; started 0 burst runner(s)', file=sys.stderr, flush=True)
+    if queued <= idle:
+        return
+    with host_lock():
+        workers, memory = live_workers(folder), vm_memory()
+        running = sum(worker.kind == 'burst' for worker in workers)
+        booting = sum(worker.kind == 'burst' and starting(worker.name, time.time()) for worker in workers)
+        vms, cores, load = host_load(workers), physical_cores(), os.getloadavg()[0] + booting
+        add = 0 if STOPPING.is_set() else burst_count(queued - idle, vms, os.cpu_count(), cores, load,
+                                                      host_memory('MemAvailable') - running * memory,
+                                                      host_memory() - additional_vm_memory(workers, memory), memory)
+        for _ in range(add):
+            name = new_id()
+            burst = subprocess.Popen(worker_argv(args, '--once', '--idle', str(BURST_IDLE_SECONDS), '--name', name))
+            burst.name = name
+            note_worker(burst.pid, args.target, name, 'burst')
+            bursts.append(burst)
+    print(f'coldbox: {queued} queued job(s) and {idle} idle runner(s) on {args.target}; '
+          f'started {add} burst runner(s); host has {vms} job VM(s) and load {load:.1f} on {cores} cores',
+          file=sys.stderr, flush=True)
 
 
 def instance(target):
@@ -634,7 +1040,8 @@ def registrations():
         target = subprocess.run(['systemd-escape', '--unescape', escaped], capture_output=True, text=True).stdout
         conf = Path(f'/etc/systemd/system/{unit}.d/coldbox.conf')
         match = re.search(r'COLDBOX_SLOTS=(\d+)', conf.read_text()) if conf.exists() else None
-        found.append(dict(unit=unit, target=target.strip(), active=active, slots=int(match[1]) if match else 1))
+        found.append(dict(unit=unit, target=target.strip(), active=active, slots=int(match[1]) if match else 1,
+                          configured=conf.exists()))
     return found
 
 
@@ -642,15 +1049,25 @@ def vm_memory():
     return size_bytes(ic('profile', 'get', 'coldbox', 'limits.memory').strip())
 
 
+def slots_text(slots):
+    return f'{slots} job VM slot(s)' if slots else 'burst only: 0 slots, VMs start only for queued jobs'
+
+
 def register(args):
-    if args.slots < 1:
-        raise SystemExit('coldbox: --slots must be at least 1')
-    others = sum(r['slots'] for r in registrations() if r['active'] == 'active' and r['target'] != args.target)
-    memory, host = vm_memory(), host_memory()
-    if not fits(args.slots + others, memory, host):
-        raise SystemExit(f'coldbox: {args.slots + others} job VMs of {memory / 2**30:g} GiB do not fit in '
-                         f'{host / 2**30:.0f} GiB of RAM (2 GiB stays with the host). Use fewer --slots, or reinstall '
-                         'with a smaller COLDBOX_MEMORY.')
+    if args.slots < 0 or args.slots == 0 and '/' not in args.target:
+        raise SystemExit('coldbox: --slots must be at least 1 for an org; 0 (burst only) needs OWNER/REPO')
+    with host_lock():
+        return register_locked(args)
+
+
+def register_locked(args):
+    memory, host, cpus = vm_memory(), host_memory(), os.cpu_count()
+    total = args.slots + host_load(live_workers(STATE / 'workers'), skip=args.target)
+    if args.slots and (not fits(total, memory, host) or total > cpus):
+        raise SystemExit(f'coldbox: {total} job VMs of {memory / 2**30:g} GiB, counting running burst '
+                         f'VMs, do not fit in {host / 2**30:.0f} GiB of RAM (2 GiB stays with the host) and '
+                         f'{cpus} CPU threads (one VM each). Use fewer --slots, wait for bursts to finish, or '
+                         'reinstall with a smaller COLDBOX_MEMORY.')
     guard(args.target, args.allow_public)
     unit = f'coldbox-runner@{instance(args.target)}.service'
     dropin = f'[Service]\nEnvironment=COLDBOX_ALLOW_PUBLIC={int(args.allow_public)}\n' \
@@ -660,8 +1077,8 @@ def register(args):
                    check=True, stdout=subprocess.DEVNULL)
     subprocess.run(['sudo', 'systemctl', 'daemon-reload'], check=True)
     subprocess.run(['sudo', 'systemctl', 'enable', unit], check=True)
-    subprocess.run(['sudo', 'systemctl', 'restart', unit], check=True)
-    print(f'coldbox: {unit} running {args.slots} job VM slot(s). '
+    subprocess.run(['sudo', 'systemctl', 'restart', '--no-block', unit], check=True)
+    print(f'coldbox: {unit} running {slots_text(args.slots)}. '
           f'Add runs-on: [self-hosted, coldbox] to a workflow in {args.target}.')
     return 0
 
@@ -690,8 +1107,14 @@ def reap(args):
         failed += 1
         print(f'coldbox reap: FAILED to refresh network ACL: {error}', file=sys.stderr)
     for vm in json.loads(ic('list', '--format', 'json')):
-        expires = vm.get('config', {}).get('user.coldbox.expires')
-        if vm['name'].startswith('cbx-') and expires and int(expires) < time.time():
+        if not vm['name'].startswith('cbx-'):
+            continue
+        try:
+            expires = int((vm.get('config') or {})['user.coldbox.expires'])
+        except (KeyError, TypeError, ValueError):
+            print(f"coldbox reap: skipped {vm['name']}: no readable user.coldbox.expires", file=sys.stderr)
+            continue
+        if expires < time.time():
             gone = destroy(vm['name'])
             failed += not gone
             print(f"coldbox reap: {vm['name']} {'deleted' if gone else 'FAILED to delete'}")
@@ -717,7 +1140,7 @@ apt-get update -q
 apt-get upgrade -y -q
 apt-get install -y -q --no-install-recommends ca-certificates curl git jq unzip zstd xz-utils build-essential \
     python3 python3-pip python3-venv python3-pytest nodejs npm golang-go rustc cargo rustfmt rust-clippy \
-    shellcheck restic rclone sudo docker.io docker-buildx docker-compose-v2
+    shellcheck gh restic rclone sudo docker.io docker-buildx docker-compose-v2
 id runner >/dev/null 2>&1 || useradd -m -u 1001 -s /bin/bash runner
 echo 'runner ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/runner
 usermod -aG docker runner
@@ -732,6 +1155,7 @@ chown -R runner:runner /opt/actions-runner
 /opt/actions-runner/bin/installdependencies.sh
 printf '#!/bin/sh\nexec /usr/local/bin/coldbox job-started\n' >/opt/coldbox-job-started.sh
 chmod 755 /opt/coldbox-job-started.sh
+printf 'preserve_hostname: true\n' >/etc/cloud/cloud.cfg.d/90-coldbox.cfg
 apt-get clean
 cloud-init clean --logs --machine-id
 rm -f /var/lib/dbus/machine-id
@@ -779,6 +1203,16 @@ def push_guest_files(name):
         raise subprocess.CalledProcessError(packed, pack.args)
 
 
+def seed_cloud_init_on_create_only(name):
+    path = f'/1.0/instances/{name}/metadata?project={PROJECT}'
+    metadata = query(path)
+    for target, template in metadata['templates'].items():
+        if target.startswith('/var/lib/cloud/seed/'):
+            template['when'] = [when for when in template['when'] if when != 'copy']
+    subprocess.run(['incus', '--force-local', 'query', '-X', 'PUT', '--data', json.dumps(metadata), path],
+                   check=True, capture_output=True)
+
+
 def build_new_base():
     version, url, digest = runner_release(fetch_json(RUNNER_RELEASES))
     new = 'base-new'
@@ -790,12 +1224,34 @@ def build_new_base():
                        input=GUEST_SETUP.encode(), check=True)
         push_guest_files(new)
         ic('stop', new)
+        seed_cloud_init_on_create_only(new)
         ic('config', 'set', new, f'user.coldbox.runner={version}')
         ic('snapshot', 'create', new, 'warm')
     except BaseException:
         destroy(new)
         raise
     return version
+
+
+ZABBLY_LTS = ('sudo curl -fsSLo /etc/apt/keyrings/zabbly.asc https://pkgs.zabbly.com/key.asc && printf "Types: deb\\nURIs: '
+              'https://pkgs.zabbly.com/incus/lts-6.0\\nSuites: %s\\nComponents: main\\nSigned-By: /etc/apt/keyrings/zabbly.asc\\n" '
+              '"$(. /etc/os-release && echo $VERSION_CODENAME)" | sudo tee /etc/apt/sources.list.d/zabbly-incus-lts-6.0.sources '
+              '>/dev/null && sudo apt-get update && sudo apt-get install -y incus')
+
+
+def incus_crashes(version):
+    match = re.match(r'6\.(\d+)\.?(\d*)', version)
+    return bool(match) and (int(match[2] or 0) < 6 if match[1] == '0' else int(match[1]) <= 21)
+
+
+def kvm_fix():
+    try:
+        virt = subprocess.run(['systemd-detect-virt'], capture_output=True, text=True).stdout.strip()
+    except OSError:
+        virt = ''
+    if virt in ('', 'none'):
+        return 'enable VT-x/AMD-V in the BIOS'
+    return f'this host is a {virt} VM or container, so Coldbox needs nested virtualization from its provider, see docs/vps.md'
 
 
 def status(_args):
@@ -807,7 +1263,7 @@ def status(_args):
             print(f'      fix: {fix}')
             failures.append(text)
 
-    check(Path('/dev/kvm').exists(), 'hardware virtualization (/dev/kvm)', 'enable VT-x/AMD-V in the BIOS')
+    check(Path('/dev/kvm').exists(), 'hardware virtualization (/dev/kvm)', kvm_fix())
     try:
         gh_ok, gh_fix = subprocess.run(['gh', 'auth', 'status'], capture_output=True).returncode == 0, 'gh auth login'
     except OSError:
@@ -818,14 +1274,17 @@ def status(_args):
         check(active, f'{timer} is active', 'sudo ./install.sh')
     registered = registrations()
     try:
+        version = query('/1.0')['environment']['server_version']
+        check(not incus_crashes(version), f'Incus {version} has the fix for crash lxc/incus#2865 (6.0.6+)',
+              f'{ZABBLY_LTS} && sudo coldbox build-base')
         snapshot = query(f'/1.0/instances/base-dev/snapshots/warm?project={PROJECT}')
         runner = query(f'/1.0/instances/base-dev?project={PROJECT}')['config'].get('user.coldbox.runner', 'unknown')
         built = datetime.fromisoformat(snapshot['created_at'][:19]).replace(tzinfo=timezone.utc)
         age = (datetime.now(timezone.utc) - built).days
         check(age <= 14, f'base image built {age} day(s) ago, actions-runner {runner}', 'sudo coldbox build-base')
-        space = query('/1.0/storage-pools/coldbox/resources')['space']
+        space = query(f'/1.0/storage-pools/{POOL}/resources')['space']
         check(space['used'] < 0.9 * space['total'],
-              f"storage pool coldbox: {space['used'] / 2**30:.0f} of {space['total'] / 2**30:.0f} GiB used",
+              f"storage pool {POOL}: {space['used'] / 2**30:.0f} of {space['total'] / 2**30:.0f} GiB used",
               'run coldbox reap, or reinstall with a larger COLDBOX_POOL_SIZE')
         memory, host = vm_memory(), host_memory()
         slots = sum(r['slots'] for r in registered if r['active'] == 'active')
@@ -836,14 +1295,21 @@ def status(_args):
     except (OSError, ValueError, subprocess.CalledProcessError):
         check(False, 'Coldbox is installed (base-dev/warm, storage pool, profile)', 'sudo ./install.sh')
         vms = []
+    try:
+        standby = standby_seconds()
+    except ValueError as error:
+        standby = 0
+        check(False, str(error), f'write a number of seconds to {STANDBY}, or delete it')
     print('\nRunners')
+    if standby:
+        print(f'  standby host: bursts start only for jobs queued over {standby} s ({STANDBY})')
     for r in registered:
-        print(f"  {r['target']:32} {r['active']:10} {r['slots']} slot(s)")
+        print(f"  {r['target']:32} {r['active']:10} {slots_text(r['slots'])}")
     if not registered:
         print('  none: coldbox register OWNER/REPO')
     print('\nJob VMs')
     for vm in vms:
-        left = int(vm['config'].get('user.coldbox.expires', 0)) - time.time()
+        left = int((vm.get('config') or {}).get('user.coldbox.expires', 0)) - time.time()
         print(f"  {vm['name']:24} {vm['status']:10} expires in {max(0, left) / 60:.0f} min")
     if not vms:
         print('  none')
@@ -858,14 +1324,15 @@ def status(_args):
 
 
 def detect_cmd(args):
-    found = detect(args.path)
+    found, host = detect(args.path), host_switches()
     if not found:
         print('coldbox: no checks detected; write [commands] in coldbox.toml yourself', file=sys.stderr)
         return 1
     print('# coldbox.toml: set a check to false to switch it off; replace a command under [commands].')
     print('[checks]')
     for name in [n for n in CHECK_ORDER if n in found] + [n for n in found if n not in CHECK_ORDER]:
-        print(f'{name} = true  # ' + ' ; '.join(found[name]))
+        source = f'{RECIPE}: ' if name == 'verify' else ''
+        print(f"{name} = {'true' if host.get(name, True) else 'false'}  # {source}" + ' ; '.join(found[name]))
     return 0
 
 
@@ -883,16 +1350,23 @@ def incus_group_exec(argv):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
+    words, command = argv, []
+    if argv[:1] == ['run'] and '--' in argv:
+        words, command = argv[:argv.index('--')], argv[argv.index('--') + 1:]
     parser = argparse.ArgumentParser(prog='coldbox', description=__doc__)
+    parser.add_argument('--version', action='version', version=f'%(prog)s {VERSION}')
     sub = parser.add_subparsers(dest='cmd', required=True)
     p = sub.add_parser('detect', help='print a suggested coldbox.toml for a repo')
     p.add_argument('path', nargs='?', default='.')
     p = sub.add_parser('checks', help='run the enabled checks here (used inside the VM)')
     p.add_argument('path', nargs='?', default='.')
-    p = sub.add_parser('run', help="run a local repo's checks in a throwaway VM and write a receipt")
+    p = sub.add_parser('run', help="run a local repo's checks, or -- COMMAND, in a throwaway VM and write a receipt",
+                       usage='coldbox run [-h] [--offline] [--ttl TTL] [--receipts DIR] [path | -- COMMAND [ARG ...]]')
     p.add_argument('path', nargs='?', default='.')
     p.add_argument('--offline', action='store_true', help='give the VM no network at all')
     p.add_argument('--ttl', type=int, default=3600, help='VM lifetime limit in seconds (default 3600)')
+    p.add_argument('--receipts', metavar='DIR',
+                   help=f"write the receipt to DIR instead of {STATE / 'receipts'}; for stress and test runs")
     for name, text in (('serve', 'run ephemeral runners for a repo or org in a loop'),
                        ('register', 'start a coldbox runner service for a repo or org')):
         p = sub.add_parser(name, help=text)
@@ -904,10 +1378,23 @@ def main(argv=None):
         if name == 'serve':
             p.add_argument('--once', action='store_true', help='stop after one VM')
             p.add_argument('--ttl', type=int, default=21600, help='VM lifetime limit in seconds (default 21600)')
+            p.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
+            p.add_argument('--idle', type=int, default=0, help=argparse.SUPPRESS)
+            p.add_argument('--name', help=argparse.SUPPRESS)
     p = sub.add_parser('unregister', help='stop the runner service and delete coldbox runners on GitHub')
     p.add_argument('target')
     p = sub.add_parser('reap', help='delete job VMs past their TTL and old receipts')
     p.add_argument('--keep-days', type=int, default=30, help='delete receipts older than this; 0 keeps all')
+    vm = sub.add_parser('vm', help='a disposable VM to use by hand: up, exec, down, list').add_subparsers(
+        dest='action', required=True)
+    p = vm.add_parser('up', help='start a VM from base-dev/warm and print its name')
+    p.add_argument('--ttl', type=int, default=7200, help='seconds before the reaper deletes it (default 7200)')
+    p.add_argument('--offline', action='store_true', help='give the VM no network at all')
+    p = vm.add_parser('exec', help='run a command in the VM as runner; stdin and stdout pass through')
+    p.add_argument('name')
+    p.add_argument('command', nargs='+')
+    vm.add_parser('down', help='delete the VM').add_argument('name')
+    vm.add_parser('list', help='list ad-hoc VMs')
     sub.add_parser('status', help='health checks, runners, job VMs and recent receipts')
     sub.add_parser('build-base', help='rebuild base-dev/warm with current packages and actions-runner (sudo)')
     sub.add_parser('acl', help='print the network ACL that install.sh applies')
@@ -916,7 +1403,11 @@ def main(argv=None):
     p.add_argument('--newer', help='only reports modified after this file; git-tracked reports are always skipped')
     p.add_argument('--archived', help='file listing paths copied in from git archive; those are skipped too')
     p.add_argument('dirs', nargs='+')
-    args = parser.parse_args(argv)
+    args = parser.parse_args(words)
+    if args.cmd == 'run':
+        args.command = command
+    if words is not argv and not command:
+        parser.error('run --: give a command to run')
     if args.cmd in INCUS_COMMANDS:
         incus_group_exec(argv)
     try:
@@ -931,8 +1422,8 @@ def main(argv=None):
         if args.cmd == 'junit':
             print(json.dumps(junit_summary(args.dirs, args.newer, args.archived)))
             return 0
-        return dict(detect=detect_cmd, run=run_local, serve=serve, register=register, unregister=unregister,
-                    reap=reap, status=status, **{'build-base': build_base})[args.cmd](args)
+        return dict(detect=detect_cmd, run=run_adhoc if command else run_local, serve=serve, register=register, unregister=unregister,
+                    reap=reap, status=status, vm=vm_cmd, **{'build-base': build_base})[args.cmd](args)
     except ConfigError as error:
         print(f'coldbox: {error}', file=sys.stderr)
         return 2

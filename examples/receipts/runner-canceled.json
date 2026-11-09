@@ -1,0 +1,40 @@
+{
+  "schema": "coldbox.receipt/v1",
+  "id": "cbx-1794156659-fb178d",
+  "mode": "runner",
+  "repo": "TayHCode/example-repo",
+  "sha": "f1f7585e949ef0fe9ac41901a6f4ac8a7d4acff1",
+  "verdict": "canceled",
+  "checks": [],
+  "started_at": "2026-11-08T16:51:01+00:00",
+  "log": "/var/lib/coldbox/receipts/cbx-1794156659-fb178d.log",
+  "runner_id": 101,
+  "vm": {
+    "name": "cbx-1794156659-fb178d",
+    "image": "base-dev/warm",
+    "ttl_seconds": 21600,
+    "offline": false,
+    "destroyed": true,
+    "ready_seconds": 74.326,
+    "destroyed_at": "2026-11-08T16:56:17+00:00",
+    "lifetime_seconds": 316.262
+  },
+  "job_seconds": 236.375,
+  "exit": 0,
+  "job_name": "verify",
+  "job_result": "Canceled",
+  "github": {
+    "repo": "TayHCode/example-repo",
+    "sha": "f1f7585e949ef0fe9ac41901a6f4ac8a7d4acff1",
+    "ref": "refs/pull/82/merge",
+    "event": "pull_request",
+    "workflow": "verify",
+    "job": "verify",
+    "run_id": "42501953470",
+    "run_attempt": "1",
+    "actor": "TayHCode",
+    "fork_pr": false,
+    "refused": null
+  },
+  "seconds": 316.262
+}

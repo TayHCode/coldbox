@@ -8,11 +8,16 @@ No Incus is needed for the tests. They need Python 3.11+, git and shellcheck.
 
 ```sh
 python3 -m unittest discover -s tests -v
-shellcheck install.sh uninstall.sh
+shellcheck $(git ls-files '*.sh')
 ```
 
 CI (`.github/workflows/verify.yml`) runs the same two commands on GitHub-hosted `ubuntu-latest`. A change that
 touches behavior needs a test in `tests/test_coldbox.py` that fails without it.
+
+`tests/stress.sh LANES SECONDS` runs `coldbox run` in parallel lanes against a throwaway fixture on a Coldbox host
+and fails if Incus restarted or a job did not pass. Its receipts go to `.smoke/stress-<time>/receipts`, never to
+`/var/lib/coldbox/receipts`. Any other manual or test `coldbox run` on a production host needs `--receipts DIR` too,
+so Coldfix only sees real jobs.
 
 ## Style
 

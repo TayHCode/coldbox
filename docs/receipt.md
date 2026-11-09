@@ -1,7 +1,7 @@
 # Receipt format: `coldbox.receipt/v1`
 
 Every job VM writes one JSON receipt to `/var/lib/coldbox/receipts/<id>.json`, with its full console log next to it
-(`<id>.log`). `examples/receipts/` has real ones.
+(`<id>.log`). `coldbox run --receipts DIR` writes them to DIR instead, for stress and test runs. `examples/receipts/` has real ones.
 
 ## Stability
 
@@ -15,8 +15,10 @@ Optional fields are missing, not `null`, when they don't apply, except where not
 | --- | --- | --- |
 | `schema` | string | `coldbox.receipt/v1` |
 | `id` | string | `cbx-<unix time>-<random>`; also the VM name and the GitHub runner name |
-| `mode` | string | `local` (`coldbox run`) or `runner` (a GitHub Actions job) |
-| `repo` | string | `OWNER/REPO`. Local mode uses the `origin` remote, or the folder name without one |
+| `mode` | string | `local` (`coldbox run`), `adhoc` (`coldbox run -- CMD`) or `runner` (a GitHub Actions job) |
+| `host` | string | Hostname of the machine that ran the VM. Missing in receipts written before it was added |
+| `repo` | string | `OWNER/REPO`. Local mode uses the `origin` remote, or the folder name without one; ad-hoc mode is `adhoc` |
+| `command` | list | Ad-hoc mode: the command's argv |
 | `sha` | string or null | Commit that ran. Runner mode: `GITHUB_SHA`; null if no job was picked up |
 | `verdict` | string | See below |
 | `checks` | list | Always present; empty unless `coldbox checks` ran. `{check, command, status, exit, seconds}` per command; `status` is `pass`, `fail` or `skipped` |
@@ -26,10 +28,10 @@ Optional fields are missing, not `null`, when they don't apply, except where not
 | `exit` | int | Exit code of the job command in the VM |
 | `job_seconds` | number | Time the job command ran |
 | `seconds` | number | VM create to VM destroyed |
-| `error` | string | Why the job could not finish (`TTL reached`, `stopped`, a failed command) |
+| `error` | string | Why the job could not finish (`TTL reached`, `no job before the burst idle limit`, `stopped`, a failed command) |
 | `vm` | object | `name`, `image`, `ttl_seconds`, `offline`, `ready_seconds`, `destroyed` (bool), `destroyed_at`, `lifetime_seconds` |
 | `runner_id` | int | Runner mode: the GitHub runner id |
-| `job_name` | string | Runner mode: the job's display name from the runner log, e.g. `test (3.12)` for a matrix leg |
+| `job_name` | string | Runner mode: the job's display name from the runner log, e.g. `test (3.12)` for a matrix leg. Also set when the runner was stopped while it was running a job |
 | `job_result` | string | Runner mode: the runner's conclusion, `Succeeded`, `Failed` or `Canceled` |
 | `github` | object | Runner mode, from the job-started hook: `repo`, `sha`, `ref`, `event`, `workflow`, `job` (the job id), `run_id`, `run_attempt`, `actor`, `fork_pr` (true, false, or null when the event can't show where the code came from), `refused` (null or a reason) |
 | `tests` | object | Present when JUnit XML reports were found. See below |
@@ -38,13 +40,16 @@ Optional fields are missing, not `null`, when they don't apply, except where not
 
 | Value | Meaning |
 | --- | --- |
-| `pass` | No `error`, and: runner, `job_result` is `Succeeded` and the job-started hook recorded `github`; local, every check passed and exit 0 |
-| `fail` | A check failed or `job_result` is `Failed` |
+| `pass` | No `error`, and: runner, `job_result` is `Succeeded` and the job-started hook recorded `github`; local, every check passed and exit 0; ad-hoc, exit 0 |
+| `fail` | A check failed, `job_result` is `Failed`, or an ad-hoc command exited non-zero |
 | `refused` | The job-started hook refused it: a fork pull request, or an event such as `merge_group` that can't show where its code came from |
-| `idle` | A runner VM reached its TTL without being given a job |
-| `incomplete` | Anything else: the VM was not confirmed destroyed, an `error` was recorded, the job was canceled, or it stopped early |
+| `canceled` | No `error`, runner, the job-started hook recorded `github`, and `job_result` is `Canceled`: GitHub canceled the job (a newer push, a manual cancel or the workflow's `timeout-minutes`) |
+| `idle` | A runner VM reached its TTL, reached the burst 10-minute idle limit, or was stopped (`error` is `stopped`) without being given a job: no `github` and no `job_name` |
+| `incomplete` | Anything else: the VM was not confirmed destroyed, an `error` was recorded, or it stopped early, including a runner stopped while it was running a job |
 
-`incomplete` is never a pass. A reader that sees `vm.destroyed: false` should treat the host as needing attention.
+A failed check or a `Failed` job is `fail` even if it was also stopped or canceled. `canceled`, `idle` and `incomplete`
+are never a pass. Older receipts read `incomplete` for both a canceled job and a stopped idle runner. A reader that sees
+`vm.destroyed: false` should treat the host as needing attention.
 
 ### `tests`
 
