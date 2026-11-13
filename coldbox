@@ -1,29 +1,40 @@
 #!/usr/bin/env python3
 """Coldbox: run CI checks in one throwaway Incus VM per job."""
 import argparse
+import base64
 import collections
+import concurrent.futures
+import configparser
+import errno
 import fcntl
 import grp
+import hashlib
 import ipaddress
 import json
+import math
 import os
 import pwd
 import re
 import secrets
 import shlex
+import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
 import threading
+import tarfile
 import tomllib
 import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
-VERSION = '0.1.0'
+LOADED_CODE = sys._getframe().f_code
+VERSION = '0.2.0'
 INCUS_ENV = Path(os.environ.get('COLDBOX_INCUS_ENV', '/etc/coldbox/incus.env'))
 INCUS = dict(COLDBOX_NAME_PREFIX='coldbox', COLDBOX_SUBNET='10.204.0.1/24')
 if INCUS_ENV.is_file():
@@ -38,15 +49,23 @@ RUNNER_RELEASES = 'https://api.github.com/repos/actions/runner/releases/latest'
 UNITS = {'': 1, 'B': 1, 'KB': 10**3, 'MB': 10**6, 'GB': 10**9, 'TB': 10**12,
          'KiB': 2**10, 'MiB': 2**20, 'GiB': 2**30, 'TiB': 2**40}
 HOST_RESERVE = 2 * 2**30
-INCUS_COMMANDS = {'run', 'serve', 'register', 'reap', 'status', 'vm'}
+HOST_IDLE = 1536 * 2**20
+INCUS_COMMANDS = {'run', 'serve', 'register', 'reap', 'status', 'vm', 'selftest'}
 ADHOC = 'user.coldbox.adhoc'
+MANAGED, EXPIRES = 'user.coldbox.managed', 'user.coldbox.expires'
+ROLLBACK_WINDOW = 14 * 86400
 STATE = Path(os.environ.get('COLDBOX_STATE', '/var/lib/coldbox'))
 GUEST_JOB_DIR = '/var/lib/coldbox/job'
 GUEST_FILES = Path('/etc/coldbox/guest')
 HOST_CHECKS = Path(os.environ.get('COLDBOX_HOST_CHECKS', '/etc/coldbox/checks.toml'))
-STANDBY = Path(os.environ.get('COLDBOX_STANDBY', '/etc/coldbox/standby'))
-CPUS = Path('/sys/devices/system/cpu')
+RESERVE = Path(os.environ.get('COLDBOX_RESERVE', '/etc/coldbox/reserve'))
+VM_MAX = Path('/etc/coldbox/vm-max')
 RUNNER = 'runner'
+APP_KEY = Path('/etc/coldbox/github-app.pem')
+APP_ENV = Path(os.environ.get('COLDBOX_GITHUB_APP_ENV', '/etc/coldbox/github-app.env'))
+APP_TOKENS = {}
+APP_LOCK = threading.Lock()
+APPROVAL = 'all_external_contributors'
 SAME_REPO_EVENTS = {'push', 'workflow_dispatch', 'schedule', 'repository_dispatch', 'release', 'create', 'delete'}
 JUNIT_DIRS = dict(local=[f'{GUEST_JOB_DIR}/junit', f'/home/{RUNNER}/repo'],
                   runner=[f'{GUEST_JOB_DIR}/junit', '/opt/actions-runner/_work'],
@@ -55,28 +74,77 @@ JUNIT_STATUS = (('failure', 'failed'), ('error', 'error'), ('skipped', 'skipped'
 MAX_TEST_RESULTS = 5000
 JOB_STARTED = f'{GUEST_JOB_DIR}/started'
 ARCHIVED = f'{GUEST_JOB_DIR}/archived'
+CLONE = ('token=$(cat); mkdir -p ~/repo && cd ~/repo && git init -q && '
+         'if [ -n "$token" ]; then export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraHeader '
+         'GIT_CONFIG_VALUE_0="Authorization: Basic $(printf x-access-token:%s "$token" | base64 -w0)"; fi && '
+         'git fetch -q --depth 1 "$1" "$2" && git checkout -q --detach FETCH_HEAD && '
+         f'test "$(git rev-parse HEAD)" = "$2" && git ls-files | sed "s|^|$HOME/repo/|" > {ARCHIVED}')
+ARTIFACTS = f'{GUEST_JOB_DIR}/artifacts'
+ARTIFACT_BYTES, ARTIFACT_FILES, ARTIFACT_SECONDS, ARTIFACT_MEMORY = 100 * 2**20, 1000, 120, 512 * 2**20
 PYTEST_CONFIGS = ('pytest.ini', 'pyproject.toml', 'setup.cfg', 'tox.ini')
 LABELS = ['self-hosted', 'linux', 'x64', 'coldbox']
+SIZES = ('default', 'small', 'large')
 CHECK_ORDER = ['setup', 'lint', 'test', 'verify']
-RECIPE = '.fleet/verify.sh'
+WORKFLOW = '''\
+name: verify
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+jobs:
+  verify:
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || fromJSON('["self-hosted", "coldbox"]') }}
+    timeout-minutes: 60
+    steps:
+      - name: Refuse fork pull requests
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          echo "Fork pull requests are not verified on Coldbox." >&2
+          exit 1
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - run: coldbox checks
+'''
 AUTOSCALE_SECONDS = 30
+# A busy job VM averaged 1.5 cores (p90 5.2-5.9) over 1,424 CI jobs on 2026-11-12.
+CORES_PER_JOB = 3
 BURST_IDLE_SECONDS = 600
 STARTING_SECONDS = 180
 QUOTA_RESERVE = 500
 IDLE_RELEASED = 'no job before the burst idle limit'
+NO_TESTS = 'no tests ran: no JUnit XML and no .cold/verify-result.json from ColdVerify reported a test that ran'
 CLEANUP = threading.Event()
 STOPPING = threading.Event()
+DRAINING = threading.Event()
+ACTIVE_LOG = None
 IDLE_UNIT = {'inactive', 'failed'}
 NAME = re.compile(r'[a-z][a-z0-9_-]*')
-RAN_A_TEST = " 2>&1 | awk '{{print}} /{}/{{ok=1}} END{{exit !ok}}' || {{ echo 'coldbox: no passing test in the output' >&2; exit 1; }}"
-GO_TEST = 'go test -v ./...' + RAN_A_TEST.format(r'^[ \t]*--- PASS')
-CARGO_TEST = 'cargo test' + RAN_A_TEST.format(r'^test result: ok\. [1-9]')
+RAN_A_TEST = (" 2>&1 | awk '{{print}} /{}/{{ok=1}} /{}/{{n++}} END{{f=ENVIRON[\"COLDBOX_JUNIT\"]; if (f) {{"
+              "printf \"<testsuite>\" > f; for (i = 0; i < n; i++) printf \"<testcase/>\" > f; print \"</testsuite>\" > f}} "
+              "exit !ok}}' || {{ echo 'coldbox: no passing test in the output' >&2; exit 1; }}")
+GO_TEST = 'go test -v ./...' + RAN_A_TEST.format(r'^[ \t]*--- PASS', r'^[ \t]*--- PASS')
+CARGO_TEST = 'cargo test' + RAN_A_TEST.format(r'^test result: ok\. [1-9]', r'^test .* \.\.\. ok$')
 RUST_TEST = re.compile(r'#\[(?:\w+::)*test\]')
 TARGET = re.compile(r'[A-Za-z0-9][A-Za-z0-9-]*(/[A-Za-z0-9_.-]+)?')
+PY_VENV = 'python3 -m venv "${TMPDIR:-/tmp}/coldbox-py" && . "${TMPDIR:-/tmp}/coldbox-py/bin/activate" && '
 SKIP_DIRS = {'node_modules', 'target', 'vendor'}
 
 
+class GitHubTransient(RuntimeError):
+    pass
+
+
 class ConfigError(Exception):
+    pass
+
+
+class Unsafe(ValueError):
     pass
 
 
@@ -84,8 +152,12 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat(timespec='seconds')
 
 
+def host_tag(host):
+    return re.sub(r'[^a-z0-9]+', '-', host.lower()).strip('-')[:20].strip('-') or 'host'
+
+
 def new_id():
-    return f'cbx-{int(time.time())}-{secrets.token_hex(3)}'
+    return f'cbx-{int(time.time())}-{secrets.token_hex(3)}-{host_tag(os.uname().nodename)}'
 
 
 def write_json(path, data):
@@ -105,12 +177,46 @@ def size_bytes(text):
 def host_memory(field='MemTotal'):
     for line in Path('/proc/meminfo').read_text().splitlines():
         if line.startswith(f'{field}:'):
-            return int(line.split()[1]) * 1024
+            arc = min(reclaimable_arc(), memory_floor(host_memory())) if field == 'MemAvailable' else 0
+            return int(line.split()[1]) * 1024 + arc
     raise RuntimeError(f'{field} missing from /proc/meminfo')
 
 
+def reclaimable_arc():
+    """Clean ZFS ARC buffers above c_min, which ZFS evicts under memory pressure but MemAvailable does not count
+    (OpenZFS arc_evictable_memory). A page-cache ARC minimum (zfs_arc_pc_percent) raises c_min, so none counts then."""
+    try:
+        if Path('/sys/module/zfs/parameters/zfs_arc_pc_percent').read_text().strip() != '0':
+            return 0
+        stats = dict(line.split()[::2] for line in Path('/proc/spl/kstat/zfs/arcstats').read_text().splitlines()[2:])
+        clean = sum(int(stats[f'{state}_evictable_{kind}']) for state in ('mru', 'mfu') for kind in ('data', 'metadata'))
+        return max(0, min(clean, int(stats['size']) - int(stats['c_min'])))
+    except (OSError, KeyError, ValueError):
+        return 0
+
+
+def memory_floor(total):
+    return max(HOST_RESERVE, total // 8)
+
+
+def host_share(host):
+    return memory_floor(host) + HOST_IDLE
+
+
 def fits(slots, vm_memory, host):
-    return slots * vm_memory <= host - HOST_RESERVE
+    return slots * vm_memory <= host - host_share(host)
+
+
+def large_memory(memory, host):
+    return max(memory, min(2 * memory, host - host_share(host)))
+
+
+def slot_limit(memory, host, reserve):
+    return min(vm_bound(reserve) - 1, (host - host_share(host) - large_memory(memory, host)) // memory)
+
+
+def vm_bound(reserve):
+    return (os.cpu_count() - reserve) // CORES_PER_JOB
 
 
 def runner_release(release):
@@ -143,19 +249,69 @@ def detect(root):
     def add(check, command):
         found.setdefault(check, []).append(command)
 
-    if has('pyproject.toml', 'setup.py', 'setup.cfg', 'requirements.txt') or files('*.py'):
+    if has('pyproject.toml', 'setup.py', 'setup.cfg', 'requirements.txt', 'ruff.toml', '.ruff.toml', 'mypy.ini',
+           '.mypy.ini') or files('*.py'):
         if has('requirements.txt'):
             add('setup', 'pip3 install -r requirements.txt')
         add('lint', "python3 -m compileall -q -x '/[.]|node_modules' .")
+        try:
+            pyproject = tomllib.loads((root / 'pyproject.toml').read_text())
+        except (OSError, tomllib.TOMLDecodeError):
+            pyproject = {}
+        tool = pyproject.get('tool') if isinstance(pyproject.get('tool'), dict) else {}
+        if isinstance(tool.get('ruff'), dict) or has('ruff.toml', '.ruff.toml'):
+            add('lint', PY_VENV + 'pip install -q ruff && ruff check .')
+        mypy = tool.get('mypy') if isinstance(tool.get('mypy'), dict) else None
+        ini_file = next((root / name for name in ('mypy.ini', '.mypy.ini') if has(name)), None)
+        if ini_file:
+            ini = configparser.ConfigParser(interpolation=None)
+            try:
+                ini.read(ini_file)
+            except (configparser.Error, UnicodeDecodeError):
+                pass
+            listed = ini.get('mypy', 'files', fallback=None)
+        else:
+            listed = mypy and mypy.get('files')
+        if mypy is not None or ini_file:
+            install = 'mypy' + (' .' if 'project' in pyproject else '') + (' -r requirements.txt' if has('requirements.txt') else '')
+            add('lint', PY_VENV + f"pip install -q {install} && mypy{'' if listed else ' .'}")
         if files('test_*.py') or files('*_test.py'):
             add('test', 'python3 -m pytest -q')
     if has('package.json'):
-        scripts = json.loads((root / 'package.json').read_text()).get('scripts', {})
-        add('setup', 'npm ci' if has('package-lock.json') else 'npm install')
+        package = json.loads((root / 'package.json').read_text())
+        scripts = package.get('scripts', {})
+        deps = package.get('dependencies', {}) | package.get('devDependencies', {})
+
+        def configured(tool, *patterns):
+            return tool in deps or tool in package or any(next(root.glob(p), None) for p in patterns)
+
+        pinned = package.get('packageManager')
+        pinned = pinned.split('+')[0] if isinstance(pinned, str) else ''
+        lock = 'pnpm' if has('pnpm-lock.yaml') else 'yarn' if has('yarn.lock') else None
+        version = pinned.removeprefix(f'{lock}@') if lock and re.fullmatch(rf'{lock}@[0-9][0-9A-Za-z.-]*', pinned) else ''
+        berry = lock == 'yarn' and version and version.split('.')[0] != '1' and not has('package-lock.json')
+        run = f'npx --yes -p @yarnpkg/cli-dist@{version} yarn' if berry else 'npx --yes'
+        if has('package-lock.json'):
+            add('setup', 'npm ci')
+        elif lock:
+            if berry:
+                add('setup', f'{run} install --immutable')
+            else:
+                add('setup', f"npx --yes {lock}{'@' + version if version else ''} install --frozen-lockfile")
+        else:
+            add('setup', 'npm install')
         if 'lint' in scripts:
             add('lint', 'npm run lint')
+        elif configured('eslint', 'eslint.config.*', '.eslintrc*') or 'eslintConfig' in package:
+            add('lint', f'{run} eslint .')
+        if has('tsconfig.json'):
+            add('lint', f'{run} tsc --noEmit' if berry else 'npx --yes -p typescript tsc --noEmit')
         if 'test' in scripts and 'no test specified' not in scripts['test']:
             add('test', 'npm test')
+        elif configured('vitest', 'vitest.config.*'):
+            add('test', f'{run} vitest run')
+        elif configured('jest', 'jest.config.*'):
+            add('test', f'{run} jest')
     if has('go.mod'):
         add('lint', 'test -z "$(gofmt -l .)" && go vet ./...')
         if files('*_test.go'):
@@ -166,21 +322,22 @@ def detect(root):
             add('test', CARGO_TEST)
     if files('*.sh'):
         add('lint', "find . -name '*.sh' -not -path '*/.*' -not -path '*/node_modules/*' -print0 | xargs -0 shellcheck")
-    if has(RECIPE):
-        add('verify', 'coldverify --ci')
     return found
 
 
 def load_config(path, label='coldbox.toml'):
     if not path.exists():
-        return {}, {}
+        return {}, {}, None
     try:
         data = tomllib.loads(path.read_text())
     except tomllib.TOMLDecodeError as error:
         raise ConfigError(f'{label}: {error}')
-    unknown = set(data) - {'checks', 'commands'}
+    unknown = set(data) - {'checks', 'commands', 'vm'}
     if unknown:
-        raise ConfigError(f'{label}: unknown section {sorted(unknown)[0]!r}; use [checks] and [commands]')
+        raise ConfigError(f'{label}: unknown section {sorted(unknown)[0]!r}; use [checks], [commands] and [vm]')
+    vm = data.get('vm', {})
+    if not isinstance(vm, dict) or set(vm) - {'size'} or 'vm' in data and vm.get('size') not in SIZES:
+        raise ConfigError(f'{label}: [vm] holds only size = {" | ".join(map(repr, SIZES))}')
     switches, commands = data.get('checks', {}), data.get('commands', {})
     for section, table, kind in (('checks', switches, bool), ('commands', commands, str)):
         if not isinstance(table, dict):
@@ -190,24 +347,27 @@ def load_config(path, label='coldbox.toml'):
                 raise ConfigError(f'{label}: bad check name {name!r} in [{section}]')
             if type(value) is not kind or (kind is str and not value.strip()):
                 raise ConfigError(f'{label}: [{section}] {name} must be {"true or false" if kind is bool else "a command string"}')
-    return switches, commands
+    return switches, commands, vm.get('size')
 
 
 def host_switches():
-    switches, commands = load_config(HOST_CHECKS, str(HOST_CHECKS))
-    if commands:
-        raise ConfigError(f'{HOST_CHECKS}: only [checks] belongs here; put [commands] in the repo coldbox.toml')
+    switches, commands, size = load_config(HOST_CHECKS, str(HOST_CHECKS))
+    if commands or size:
+        raise ConfigError(f'{HOST_CHECKS}: only [checks] belongs here; put [commands] and [vm] in the repo coldbox.toml')
     return switches
 
 
 def plan(root):
     host = host_switches()
-    switches, overrides = load_config(Path(root) / 'coldbox.toml')
+    switches, overrides, _ = load_config(Path(root) / 'coldbox.toml')
     found = detect(root)
     found.update({name: [command] for name, command in overrides.items()})
     missing = [name for name, on in switches.items() if on and name not in found]
     if missing:
         raise ConfigError(f'coldbox.toml: check {missing[0]!r} is on but nothing was detected; add it under [commands]')
+    if 'verify' not in found and switches.get('verify', host.get('verify', True)) and (Path(root) / '.fleet/verify.sh').exists():
+        raise ConfigError('coldbox.toml: Coldbox no longer runs .fleet/verify.sh by itself; add verify = "coldverify --ci" '
+                          'under [commands], or verify = false under [checks]')
     names = [n for n in CHECK_ORDER if n in found] + [n for n in found if n not in CHECK_ORDER]
     return [(name, found[name]) for name in names if switches.get(name, host.get(name, True))]
 
@@ -219,12 +379,14 @@ def run_checks(root, out=None):
     for name, commands in steps:
         for command in commands:
             if setup_failed:
-                results.append(dict(check=name, command=command, status='skipped', exit=None, seconds=0))
+                results.append(dict(check=name, command=command, status='not_run', exit=None, seconds=0))
                 continue
             print(f'== coldbox {name}: {command}', flush=True)
             started = time.monotonic()
             env = dict(os.environ)
             if out and not sets_junitxml(root, command):
+                junit_dir.mkdir(parents=True, exist_ok=True)
+                env['COLDBOX_JUNIT'] = str(junit_dir / f'{len(results)}-count.xml')
                 junit = f"--junitxml={junit_dir / f'{len(results)}.xml'}"
                 env['PYTEST_ADDOPTS'] = ' '.join(filter(None, [os.environ.get('PYTEST_ADDOPTS'), junit]))
             code = subprocess.run(['bash', '-eo', 'pipefail', '-c', command], cwd=root, env=env).returncode
@@ -317,8 +479,42 @@ def junit_summary(dirs, newer=None, archived=None):
                 results=results[:MAX_TEST_RESULTS])
 
 
+def cold_verify_counts(dirs, newer=None, archived=None):
+    since = os.stat(newer).st_mtime if newer else 0
+    skip = frozenset(Path(archived).read_text().splitlines()) if archived else frozenset()
+    counts = []
+    for top in dirs:
+        for root, subdirs, names in os.walk(top):
+            subdirs[:] = sorted(d for d in subdirs if d == '.cold' or not d.startswith('.') and d not in ('node_modules', 'vendor'))
+            path = Path(root) / 'verify-result.json'
+            try:
+                if Path(root).name != '.cold' or 'verify-result.json' not in names or path.stat().st_mtime < since \
+                        or str(path) in skip or tracked(path):
+                    continue
+            except OSError:
+                continue
+            try:
+                count = json.loads(path.read_text()).get('tests_ran')
+            except (OSError, ValueError, AttributeError):
+                count = None
+            counts.append(count if type(count) is int and count >= 0 else None)
+    return counts
+
+
+def tests_ran(junit, cold_verify):
+    if junit['files']:
+        return junit['total'] - junit['skipped'], 'junit'
+    if None in cold_verify:
+        return None, 'cold-verify'
+    if cold_verify:
+        return sum(cold_verify), 'cold-verify'
+    return 0, None
+
+
 def job_started(env=None):
     env = os.environ if env is None else env
+    if env.get('COLDBOX_CI_PRIMARY'):
+        admission_check(argparse.Namespace(expected_primary=env['COLDBOX_CI_PRIMARY']), env=env)
     event = {}
     if env.get('GITHUB_EVENT_PATH'):
         event = json.loads(Path(env['GITHUB_EVENT_PATH']).read_text())
@@ -332,19 +528,74 @@ def job_started(env=None):
     if pr or name == 'workflow_run':
         head, base = ((repo or {}).get('full_name') for repo in repos)
         fork = head is None or head != base
-    refused = None
-    if fork is not False and env.get('COLDBOX_ALLOW_FORKS') != '1':
+    writers, refused = env.get('COLDBOX_PUBLIC_WRITERS'), None
+    if writers is not None:
+        actor = env.get('GITHUB_TRIGGERING_ACTOR') or env.get('GITHUB_ACTOR')
+        refused = outsider(name, fork, actor, writers.split(','))
+    elif fork is not False and env.get('COLDBOX_ALLOW_FORKS') != '1':
         refused = 'fork pull request' if fork else f'{name or "unknown"} event: cannot tell whether the code is from a fork'
     job = dict(repo=env.get('GITHUB_REPOSITORY'), sha=env.get('GITHUB_SHA'), ref=env.get('GITHUB_REF'),
                event=name, workflow=env.get('GITHUB_WORKFLOW'), job=env.get('GITHUB_JOB'),
                run_id=env.get('GITHUB_RUN_ID'), run_attempt=env.get('GITHUB_RUN_ATTEMPT'),
-               actor=env.get('GITHUB_ACTOR'), fork_pr=fork, refused=refused)
+               actor=env.get('GITHUB_ACTOR'), fork_pr=fork, refused=refused, started_at=now_iso())
     if env.get('COLDBOX_JOB_DIR'):
         write_json(Path(env['COLDBOX_JOB_DIR']) / 'job.json', job)
     if refused:
-        print(f'coldbox: refusing this job ({refused}); register with --allow-forks to run it', file=sys.stderr)
+        hint = '' if writers is not None else '; register with --allow-forks to run it'
+        print(f'coldbox: refusing this job ({refused}){hint}', file=sys.stderr)
         return 1
     return 0
+
+
+def record_queue_wait(metadata, runner):
+    try:
+        path = (f"repos/{metadata['repo']}/actions/runs/{metadata['run_id']}/"
+                f"attempts/{metadata['run_attempt']}/jobs?")
+        jobs, page = [], 1
+        while True:
+            batch = gh(f'{path}per_page=100&page={page}')['jobs']
+            jobs.extend(batch)
+            if len(batch) < 100:
+                break
+            page += 1
+        matched = next(job for job in jobs if job.get('runner_name') == runner)
+        queued, started = matched['created_at'], matched['started_at']
+        seconds = (datetime.fromisoformat(started) -
+                   datetime.fromisoformat(queued)).total_seconds()
+        if seconds < 0:
+            raise ValueError('job started before it was queued')
+        metadata.update(job_id=matched['id'], queued_at=queued, runner_started_at=started,
+                        queue_wait_seconds=round(seconds, 3))
+        if matched.get('completed_at'):
+            metadata['completed_at'] = matched['completed_at']
+        if steps := job_steps(matched.get('steps')):
+            metadata['steps'] = steps
+        print(f'coldbox: {runner} queue waited {seconds:g} s', file=sys.stderr, flush=True)
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError, StopIteration) as error:
+        print(f'coldbox: queue wait unavailable for {runner}: {error}', file=sys.stderr, flush=True)
+
+
+def job_steps(steps):
+    found = []
+    for step in steps or []:
+        try:
+            seconds = (datetime.fromisoformat(step['completed_at']) -
+                       datetime.fromisoformat(step['started_at'])).total_seconds()
+        except (KeyError, TypeError, ValueError):
+            seconds = None
+        found.append(dict(name=step.get('name'), conclusion=step.get('conclusion'),
+                          seconds=round(seconds, 3) if seconds is not None and seconds >= 0 else None))
+    return found
+
+
+def outsider(event, fork, actor, writers):
+    """Why a job on an opted-in public repo must not run, or None. Users with write access run anything; anyone else
+    runs only a pull request from a fork, which GitHub holds until someone with write access approves it."""
+    if actor and actor.casefold() in {writer.casefold() for writer in writers}:
+        return None
+    if event == 'pull_request' and fork:
+        return None
+    return f'{event or "unknown"} event triggered by {actor or "an unknown user"}, who has no write access'
 
 
 def acl_document(addresses):
@@ -489,18 +740,145 @@ def destroy(name, attempts=3):
     return False
 
 
-def boot(name, expires, offline, *config):
+def lifecycle(expires):
+    return '--config', f'{MANAGED}=true', '--config', f'{EXPIRES}={expires}'
+
+
+def managed(vm):
+    config = vm.get('config') or {}
+    expires = config.get(EXPIRES, '')
+    readable = expires == 'never' or expires.isdigit()
+    return readable and (config.get(MANAGED) == 'true' or vm['name'].startswith('cbx-'))
+
+
+def boot(name, expires, offline, *config, base=BASE):
     sync_acl()
-    ic('copy', BASE, name, '--config', f'user.coldbox.expires={expires}', *config)
+    copy_started = time.time()
+    ic('copy', base, name, *lifecycle(expires), *config)
+    clone_seconds = round(time.time() - copy_started, 3)
     if offline:
         ic('config', 'device', 'add', name, 'eth0', 'none')
     isolated(name, offline)
+    start = time.time()
     ic('start', name)
     wait_ready(name, expires, network=not offline)
+    return dict(clone_seconds=clone_seconds, boot_seconds=round(time.time() - start, 3))
+
+
+UNREADABLE = (OSError, ValueError, KeyError, TypeError, IndexError, ArithmeticError, subprocess.SubprocessError)
+RESOURCE_FIELDS = ('cpus', 'memory_bytes', 'peak_rss_bytes', 'cpu_seconds', 'disk_read_bytes', 'disk_write_bytes')
+
+
+def cpu_count(limit):
+    """`limits.cpu` is a count such as 8 or a pinned set such as 0-3,8."""
+    if limit.isdigit():
+        return int(limit)
+    cpus = set()
+    for part in limit.split(','):
+        first, _, last = part.partition('-')
+        cpus.update(range(int(first), int(last or first) + 1))
+    return len(cpus)
+
+
+def vm_resources(name):
+    """What the VM was given and used, read just before it is destroyed. A value that can't be read is null."""
+    def read(path):
+        return subprocess.run(['incus', '--force-local', 'query', path], check=True, capture_output=True, text=True,
+                              timeout=10).stdout
+
+    found = dict.fromkeys(RESOURCE_FIELDS)
+    try:
+        config = json.loads(read(f'/1.0/instances/{name}?project={PROJECT}'))['expanded_config']
+    except UNREADABLE:
+        config = {}
+    try:
+        found['cpus'] = cpu_count(config['limits.cpu'])
+    except UNREADABLE:
+        pass
+    try:
+        found['memory_bytes'] = size_bytes(config['limits.memory'])
+    except UNREADABLE:
+        pass
+    try:
+        state = json.loads(read(f'/1.0/instances/{name}/state?project={PROJECT}'))
+        found['cpu_seconds'] = round(state['cpu']['usage'] / 1e9, 3)
+        peak = re.search(r'^VmHWM:\s+(\d+) kB$', Path(f"/proc/{int(state['pid'])}/status").read_text(), re.M)
+        found['peak_rss_bytes'] = int(peak[1]) * 1024
+    except UNREADABLE:
+        pass
+    try:
+        metrics = read(f'/1.0/metrics?project={PROJECT}')
+        disk = collections.defaultdict(dict)
+        for kind, device, value in re.findall(
+                r'^incus_disk_(read|written)_bytes_total\{device="([^"]+)",name="' + re.escape(name) + r'",[^}]*\} (\S+)$',
+                metrics, re.M):
+            if re.fullmatch(r'(?!loop)[a-z]+', device):
+                disk[device][kind] = int(float(value))
+        if disk and all(kinds.keys() == {'read', 'written'} for kinds in disk.values()):
+            found['disk_read_bytes'] = sum(kinds['read'] for kinds in disk.values())
+            found['disk_write_bytes'] = sum(kinds['written'] for kinds in disk.values())
+    except UNREADABLE:
+        pass
+    return found
+
+
+def extract_artifacts(folder, max_bytes, max_files):
+    folder, max_bytes, max_files, files, total = Path(folder), int(max_bytes), int(max_files), 0, 0
+    with tarfile.open(fileobj=sys.stdin.buffer, mode='r|') as tar:
+        for member in tar:
+            inside = PurePosixPath(member.name)
+            parts = [part for part in inside.parts if part != '.']
+            if not member.isfile() or not parts or inside.is_absolute() or '..' in parts:
+                continue
+            if files == max_files or total + member.size > max_bytes:
+                return
+            target = folder.joinpath(*parts)
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with tar.extractfile(member) as source, target.open('wb') as out:
+                    shutil.copyfileobj(source, out)
+            except BaseException:
+                target.unlink(missing_ok=True)
+                raise
+            files, total = files + 1, total + member.size
+            print(json.dumps(dict(path=str(target), bytes=member.size)), flush=True)
+    print('complete', flush=True)
+
+
+def copy_artifacts(name, folder):
+    """Copies the regular files the job left in ARTIFACTS to folder. Returns them and whether every file was copied."""
+    try:
+        reader = subprocess.Popen(
+            ic_exec(name, 'sh', '-c', f'mkdir -p {ARTIFACTS} && cd {ARTIFACTS} && exec tar --hard-dereference -c .'),
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
+        return [], False
+    timer = threading.Timer(ARTIFACT_SECONDS, reader.kill)
+    timer.start()
+    parser, lines = None, []
+    try:
+        parser = subprocess.run(
+            ['prlimit', f'--as={ARTIFACT_MEMORY}', sys.executable, '-c',
+             'import runpy, sys; runpy.run_path(sys.argv[1])["extract_artifacts"](*sys.argv[2:])',
+             str(Path(__file__).resolve()), str(folder), str(ARTIFACT_BYTES), str(ARTIFACT_FILES)],
+            stdin=reader.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            timeout=ARTIFACT_SECONDS)
+        lines = parser.stdout.splitlines()
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    finally:
+        complete = parser is not None and parser.returncode == 0 and lines[-1:] == ['complete']
+        if not complete:
+            reader.kill()
+        complete = reader.wait() == 0 and complete
+        timer.cancel()
+        reader.stdout.close()
+    return [json.loads(line) for line in lines if line.startswith('{')], complete
 
 
 def job(mode, name, ttl, command, repo, sha=None, stdin=None, archive=None, offline=False, cwd=None, env=(),
-        extra=None, receipts=None):
+        extra=None, receipts=None, on_ready=None, config=(), judge=None, clone=None):
+    global ACTIVE_LOG
     CLEANUP.clear()
     receipts = Path(receipts or STATE / 'receipts')
     receipts.mkdir(parents=True, exist_ok=True)
@@ -513,53 +891,99 @@ def job(mode, name, ttl, command, repo, sha=None, stdin=None, archive=None, offl
     write_json(path, receipt)
     guest_env = [f'COLDBOX_JOB_DIR={GUEST_JOB_DIR}', 'PIP_BREAK_SYSTEM_PACKAGES=1', *env]
     with log_path.open('ab') as log:
+        ACTIVE_LOG = log_path if mode == 'runner' else None
         try:
-            boot(name, expires, offline)
+            timing = boot(name, expires, offline, *config)
             receipt['vm']['ready_seconds'] = round(time.time() - started, 3)
+            if isinstance(timing, dict):
+                receipt['vm'].update(timing)
+            receipt['vm']['host_ceiling'] = os.cpu_count()
+            write_json(path, receipt)
+            (STATE / 'ready').mkdir(parents=True, exist_ok=True)
+            (STATE / 'ready' / name).touch()
             ic('file', 'push', str(Path(__file__).resolve()), f'{name}/usr/local/bin/coldbox', '--mode', '0755')
+            push_guest_files(name)
             if HOST_CHECKS.exists():
                 ic('file', 'push', str(HOST_CHECKS), f'{name}{HOST_CHECKS}', '--create-dirs', '--mode', '0644')
             if archive is not None:
                 extract = f'mkdir -p ~/repo && tar -x -v -C ~/repo | sed "s|^|$HOME/repo/|" > {ARCHIVED}'
                 subprocess.run(ic_exec(name, 'bash', '-o', 'pipefail', '-c', extract), input=archive,
                                check=True, capture_output=True)
+            if clone:
+                subprocess.run(ic_exec(name, 'bash', '-o', 'pipefail', '-c', CLONE, 'clone',
+                                       f'https://github.com/{clone[0]}', clone[1]),
+                               input=clone[2].encode(), check=True, capture_output=True)
             subprocess.run(ic_exec(name, 'touch', JOB_STARTED), check=True, capture_output=True)
+            if mode == 'runner':
+                admission_path = receipts / f'{name}.admission'
+                receipt['admission'] = runner_admission(repo, name, expires)
+                write_json(path, receipt)
+                write_json(admission_path, receipt['admission'])
+                ic('file', 'push', str(admission_path), f'{name}/etc/coldbox/admission.json',
+                   '--create-dirs', '--mode', '0644')
+                subprocess.run(ic_exec(name, 'sh', '-c', 'printf "%s\\n" "$1" > /etc/coldbox/host',
+                                       'sh', receipt['admission']['host'], user=None), check=True, capture_output=True)
+            if on_ready:
+                on_ready()
             command_started = time.time()
+            receipt['job_started_at'] = now_iso()
+            write_json(path, receipt)
             code = tee(ic_exec(name, *command, cwd=cwd, env=guest_env, timeout=expires - time.time()), log, stdin)
             receipt['job_seconds'] = round(time.time() - command_started, 3)
+            receipt['job_ended_at'] = now_iso()
             receipt['exit'] = code
+            if judge:
+                judge(receipt, log_path)
             if mode == 'runner':
                 receipt['job_name'], receipt['job_result'] = job_outcome(log_path.read_bytes())
             if code in (124, 137) and time.time() >= expires - 1:
                 receipt['error'] = 'TTL reached'
             github, result = pull(name, f'{GUEST_JOB_DIR}/job.json'), pull(name, f'{GUEST_JOB_DIR}/checks.json')
             if github:
+                if mode == 'runner':
+                    record_queue_wait(github, name)
                 receipt.update(github=github, repo=github['repo'] or repo, sha=github['sha'])
             if result:
                 receipt.update(checks=result['checks'], checks_verdict=result['verdict'])
             tests = subprocess.run(ic_exec(name, 'coldbox', 'junit', '--newer', JOB_STARTED,
-                                           *(['--archived', ARCHIVED] if archive is not None else []),
+                                           *(['--archived', ARCHIVED] if archive is not None or clone else []),
                                            *JUNIT_DIRS[mode], timeout=120),
                                    capture_output=True, text=True)
-            if tests.returncode == 0 and json.loads(tests.stdout)['total']:
-                receipt['tests'] = json.loads(tests.stdout)
+            if tests.returncode == 0:
+                summary = json.loads(tests.stdout)
+                ran, source = tests_ran(summary, summary.pop('cold_verify', []))
+                if ran is not None:
+                    receipt.update(tests_ran=ran, tests_source=source)
+                if summary['total']:
+                    receipt['tests'] = summary
         except subprocess.CalledProcessError as error:
             stderr = error.stderr.decode() if isinstance(error.stderr, bytes) else error.stderr or ''
             receipt['error'] = f"{' '.join(map(str, error.cmd[:7]))} failed: {stderr.strip()[-500:]}"
         except (OSError, RuntimeError, ValueError) as error:
-            receipt['error'] = str(error)
+            receipt['error'] = str(error) or type(error).__name__
         except (SystemExit, KeyboardInterrupt):
             receipt['error'] = 'stopped'
+            if github := pull(name, f'{GUEST_JOB_DIR}/job.json'):
+                receipt['github'] = github
             if mode == 'runner' and (assigned := running_job(log_path.read_bytes())):
                 receipt['job_name'] = assigned
             raise
         finally:
+            ACTIVE_LOG = None
             CLEANUP.set()
+            receipt['resources'] = vm_resources(name)
+            if 'job_started_at' in receipt:
+                artifacts, complete = copy_artifacts(name, receipts / f'{name}.artifacts')
+                if artifacts or not complete:
+                    receipt.update(artifacts=artifacts, artifacts_truncated=not complete)
+            destroy_started = time.time()
             gone = destroy(name)
+            (STATE / 'ready' / name).unlink(missing_ok=True)
             ended = time.time()
-            receipt['vm'].update(destroyed=gone, destroyed_at=now_iso(), lifetime_seconds=round(ended - started, 3))
+            receipt['vm'].update(destroyed=gone, destroyed_at=now_iso(), lifetime_seconds=round(ended - started, 3),
+                                 destroy_seconds=round(ended - destroy_started, 3))
             receipt['seconds'] = round(ended - started, 3)
-            receipt['verdict'] = verdict(receipt)
+            settle(receipt)
             write_json(path, receipt)
     print(f"coldbox: {receipt['verdict'].upper()} receipt {path}", file=sys.stderr)
     return receipt
@@ -580,7 +1004,8 @@ def verdict(receipt):
         return 'incomplete'
     if (receipt.get('github') or {}).get('refused'):
         return 'refused'
-    if receipt.get('checks_verdict') == 'fail' or receipt.get('job_result') == 'Failed':
+    if (receipt.get('checks_verdict') == 'fail' or receipt.get('job_result') == 'Failed'
+            or (receipt.get('isolation') or {}).get('problems')):
         return 'fail'
     if receipt.get('error'):
         idle = (receipt['mode'] == 'runner' and 'github' not in receipt and not receipt.get('job_name')
@@ -588,14 +1013,42 @@ def verdict(receipt):
         return 'idle' if idle else 'incomplete'
     if receipt['mode'] == 'runner' and receipt.get('github'):
         if receipt.get('job_result') == 'Succeeded':
-            return 'pass'
+            return 'pass' if receipt.get('tests_ran') else 'incomplete'
         if receipt.get('job_result') == 'Canceled':
             return 'canceled'
     if receipt['mode'] == 'local' and receipt.get('checks_verdict') == 'pass' and receipt.get('exit') == 0:
-        return 'pass'
+        return 'pass' if receipt.get('tests_ran') else 'incomplete'
     if receipt['mode'] == 'adhoc' and 'exit' in receipt:
         return 'pass' if receipt['exit'] == 0 else 'fail'
     return 'incomplete'
+
+
+def cause(receipt):
+    if receipt['verdict'] == 'fail':
+        failed = next((check['check'] for check in receipt.get('checks', []) if check['status'] == 'fail'), None)
+        return failed or ('checks' if receipt.get('checks_verdict') == 'fail' else 'job')
+    if receipt['verdict'] != 'incomplete':
+        return None
+    error = receipt.get('error')
+    if error == 'stopped':
+        return 'stopped'
+    if 'ready_seconds' not in receipt['vm']:
+        return 'vm_not_ready'
+    if error:
+        return 'ttl' if error == 'TTL reached' else 'infra_error'
+    if not receipt['vm']['destroyed']:
+        return 'vm_not_destroyed'
+    return 'no_tests' if verdict(dict(receipt, tests_ran=1)) == 'pass' else 'no_result'
+
+
+def settle(receipt):
+    receipt['verdict'] = verdict(receipt)
+    receipt.pop('cause', None)
+    receipt.pop('reason', None)
+    if found := cause(receipt):
+        receipt['cause'] = found
+    if found == 'no_tests':
+        receipt['reason'] = NO_TESTS if receipt.get('tests_ran') == 0 else 'the test count could not be read'
 
 
 def git(path, *args):
@@ -603,31 +1056,208 @@ def git(path, *args):
 
 
 def run_local(args):
-    path = Path(args.path).resolve()
+    path = Path(args.path or '.').resolve()
     sha = git(path, 'rev-parse', 'HEAD').decode().strip()
     remote = subprocess.run(['git', '-C', str(path), 'remote', 'get-url', 'origin'], capture_output=True, text=True)
     match = re.search(r'[:/]([^/:]+/[^/]+?)(\.git)?$', remote.stdout.strip())
     if git(path, 'status', '--porcelain', '--', 'coldbox.toml').strip():
         raise SystemExit('coldbox: commit coldbox.toml first; the VM runs the committed HEAD')
     plan(path)
-    name = new_id()
-    if not admit(match[1] if match else path.name, name, 'once'):
+    name, (memory, config) = new_id(), sizing(args, load_config(path / 'coldbox.toml')[2] or 'default')
+    if not admit(match[1] if match else path.name, name, 'once', memory=memory):
         raise SystemExit('coldbox: the host is at its job VM ceiling; try again when a job finishes')
     receipt = job('local', name, args.ttl, ['coldbox', 'checks'], repo=match[1] if match else path.name,
                   sha=sha, archive=git(path, 'archive', '--format=tar', 'HEAD'), offline=args.offline,
-                  cwd='/home/runner/repo', receipts=args.receipts)
+                  cwd='/home/runner/repo', receipts=args.receipts, config=config)
     return exit_code(receipt)
 
 
+def run_repo(args):
+    if args.path is not None or args.command:
+        raise SystemExit('coldbox: give --repo and --sha, a repo PATH, or -- COMMAND; not more than one')
+    if not args.repo or not args.sha:
+        raise SystemExit('coldbox: --repo and --sha go together')
+    if args.offline:
+        raise SystemExit('coldbox: --repo needs the network to clone; drop --offline')
+    name, (memory, config) = new_id(), sizing(args)
+    if not admit(args.repo, name, 'once', memory=memory):
+        raise SystemExit('coldbox: the host is at its job VM ceiling; try again when a job finishes')
+    receipt = job('local', name, args.ttl, ['coldbox', 'checks'], repo=args.repo, sha=args.sha,
+                  clone=(args.repo, args.sha, repo_token(args.repo) or ''), cwd='/home/runner/repo',
+                  receipts=args.receipts, config=config)
+    return exit_code(receipt)
+
+
+def repo_name(text):
+    if not re.fullmatch(r'[A-Za-z0-9-]+/[A-Za-z0-9._-]+', text) or text.split('/')[1] in ('.', '..'):
+        raise argparse.ArgumentTypeError(f'{text!r} is not OWNER/REPO')
+    return text
+
+
+def commit_sha(text):
+    if not re.fullmatch(r'[0-9a-f]{40}', text):
+        raise argparse.ArgumentTypeError(f'{text!r} is not a full 40-character lowercase commit SHA')
+    return text
+
+
 def run_adhoc(args):
-    if args.path != '.':
+    if args.path is not None:
         raise SystemExit('coldbox: give a repo PATH or -- COMMAND, not both')
-    name = new_id()
-    if not admit('adhoc', name, 'once'):
+    name, (memory, config) = new_id(), sizing(args)
+    if not admit('adhoc', name, 'once', memory=memory):
         raise SystemExit('coldbox: the host is at its job VM ceiling; try again when a job finishes')
     receipt = job('adhoc', name, args.ttl, args.command, repo='adhoc', offline=args.offline, cwd=f'/home/{RUNNER}',
-                  extra=dict(command=args.command), receipts=args.receipts)
+                  extra=dict(command=args.command), receipts=args.receipts, config=config)
     return 125 if 'error' in receipt or 'exit' not in receipt or not receipt['vm']['destroyed'] else receipt['exit']
+
+
+SELFTEST_CONTROL = ('api.github.com', 443)
+SELFTEST_IPV6 = ('2606:4700:4700::1111', 443)
+SELFTEST_MARK = 'coldbox-selftest '
+SELFTEST_GUEST = r'''
+import json, os, socket, sys
+spec = json.load(sys.stdin)
+
+
+def connect(probe):
+    try:
+        socket.create_connection((probe['address'], probe['port']), timeout=5).close()
+        return dict(probe, error=None, errno=None)
+    except OSError as error:
+        return dict(probe, error=f'{type(error).__name__}: {error}', errno=error.errno)
+
+
+fill, chunk, written, write_errno = os.path.expanduser('~/coldbox-selftest-fill'), bytes(64 * 2**20), 0, None
+try:
+    with open(fill, 'wb', buffering=0) as out:
+        while written < spec['write_bytes']:
+            written += out.write(chunk)
+        os.fsync(out.fileno())
+except OSError as error:
+    write_errno = error.errno
+finally:
+    if os.path.exists(fill):
+        os.remove(fill)
+meminfo = open('/proc/meminfo').read()
+root = os.stat('/').st_dev
+disk = os.path.realpath(f'/sys/dev/block/{os.major(root)}:{os.minor(root)}')
+if os.path.exists(f'{disk}/partition'):
+    disk = os.path.dirname(disk)
+found = dict(probes=[connect(probe) for probe in spec['probes']],
+             cpus=len(os.sched_getaffinity(0)),
+             memory_bytes=int(meminfo.split('MemTotal:')[1].split()[0]) * 1024,
+             disk_bytes=int(open(f'{disk}/size').read()) * 512, written_bytes=written, write_errno=write_errno)
+print('coldbox-selftest ' + json.dumps(found), flush=True)
+'''
+
+
+def isolation_probes(addresses, port):
+    cgnat = ipaddress.ip_network('100.64.0.0/10')
+    probes = [dict(kind='host', address=GATEWAY, port=port)]
+    for interface in addresses:
+        for addr in interface.get('addr_info', []):
+            ip = ipaddress.ip_address(addr['local'].split('%')[0])
+            if ip.is_loopback or (ip.version == 6 and ip.is_link_local):
+                continue
+            kind = 'ipv6' if ip.version == 6 else 'tailnet' if ip in cgnat else 'lan' if ip.is_private else 'host'
+            probes.append(dict(kind=kind, address=str(ip), port=port))
+    probes += [dict(kind='ipv6', address=SELFTEST_IPV6[0], port=SELFTEST_IPV6[1]),
+               dict(kind='control', address=SELFTEST_CONTROL[0], port=SELFTEST_CONTROL[1])]
+    unique = {}
+    for probe in probes:
+        unique.setdefault((probe['address'], probe['port']), dict(probe))
+    return list(unique.values())
+
+
+def isolation_problems(found, probes, expected):
+    if not isinstance(found, dict):
+        return ['the guest reported no results']
+    if [(p['address'], p['port']) for p in found.get('probes', [])] != [(p['address'], p['port']) for p in probes]:
+        return ['the guest did not report every probe']
+    problems = []
+    for probe in found['probes']:
+        where = f"{probe['kind']} {probe['address']} port {probe['port']}"
+        if probe['kind'] == 'control' and probe['error']:
+            problems.append(f"{where} unreachable ({probe['error']}), so the blocked results prove nothing")
+        elif probe['kind'] != 'control' and not probe['error']:
+            problems.append(f'{where} was reachable')
+        elif probe['kind'] == 'ipv6' and probe['errno'] != errno.ENETUNREACH:
+            problems.append(f"{where} failed with {probe['error']}, not network unreachable, so the VM may route IPv6")
+    if found['cpus'] != expected['cpus']:
+        problems.append(f"nproc is {found['cpus']}, not the profile's {expected['cpus']}")
+    if found['memory_bytes'] > expected['memory_bytes']:
+        problems.append(f"MemTotal is {found['memory_bytes']} bytes, above the profile's {expected['memory_bytes']}")
+    if found['disk_bytes'] > expected['disk_bytes']:
+        problems.append(f"the root disk is {found['disk_bytes']} bytes, above the profile's {expected['disk_bytes']}")
+    if found['write_errno'] != errno.ENOSPC:
+        outcome = 'succeeded' if found['write_errno'] is None else f"failed with errno {found['write_errno']}, not ENOSPC"
+        problems.append(f"a {expected['write_bytes'] / 2**30:g} GiB write {outcome}")
+    return problems
+
+
+def selftest_listener():
+    try:
+        sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        sock.bind(('::', 0))
+    except OSError:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(('0.0.0.0', 0))
+    sock.listen(64)
+    return sock
+
+
+def selftest(args):
+    expected = dict(cpus=cpu_count(ic('profile', 'get', 'coldbox', 'limits.cpu').strip()), memory_bytes=vm_memory(),
+                    disk_bytes=vm_disk(), write_bytes=vm_disk() + 2**30)
+    name = new_id()
+    if not admit('selftest', name, 'once'):
+        raise SystemExit('coldbox: the host is at its job VM ceiling; try again when a job finishes')
+    with selftest_listener() as listener:
+        probes = isolation_probes(host_addresses(), listener.getsockname()[1])
+
+        def judge(receipt, log_path):
+            found = None
+            for line in log_path.read_text(errors='replace').splitlines():
+                if line.startswith(SELFTEST_MARK):
+                    found = json.loads(line.removeprefix(SELFTEST_MARK))
+            receipt['isolation'] = dict(expected=expected, found=found,
+                                        problems=isolation_problems(found, probes, expected))
+
+        receipt = job('adhoc', name, args.ttl, ['python3', '-c', SELFTEST_GUEST], repo='selftest',
+                      stdin=json.dumps(dict(probes=probes, write_bytes=expected['write_bytes'])).encode(),
+                      cwd=f'/home/{RUNNER}', extra=dict(command=['coldbox', 'selftest', 'isolation']),
+                      receipts=args.receipts, judge=judge)
+    for problem in (receipt.get('isolation') or {}).get('problems', []):
+        print(f'coldbox selftest: FAIL {problem}', file=sys.stderr)
+    return exit_code(receipt)
+
+
+def sizing(args, size='default'):
+    if args.memory and size_bytes(args.memory) > vm_memory():
+        raise SystemExit(f"coldbox: --memory {args.memory} is above the coldbox profile's limits.memory; "
+                         'it can only shrink a VM')
+    memory, limits = vm_shape(size)
+    limits.update({key: value for key, value in (('limits.cpu', args.cpus), ('limits.memory', args.memory)) if value})
+    return size_bytes(args.memory) if args.memory else memory, incus_config(limits)
+
+
+def vm_shape(size):
+    """The memory admit() reserves for a VM of this size (None: the coldbox profile's) and its limits. small halves the
+    profile's vCPUs and memory; large doubles them, up to this host's CPU threads and what one VM may take here."""
+    if size == 'default':
+        return None, {}
+    memory, cpus = vm_memory(), cpu_count(ic('profile', 'get', 'coldbox', 'limits.cpu').strip())
+    if size == 'small':
+        cpus, memory = max(1, cpus // 2), memory // 2
+    else:
+        cpus, memory = max(cpus, min(2 * cpus, os.cpu_count())), large_memory(memory, host_memory())
+    mib = memory // 2**20
+    return mib * 2**20, {'limits.cpu': str(cpus), 'limits.memory': f'{mib}MiB'}
+
+
+def incus_config(limits):
+    return [arg for key, value in limits.items() for arg in ('--config', f'{key}={value}')]
 
 
 def adhoc_vms():
@@ -637,9 +1267,29 @@ def adhoc_vms():
 
 def vm_cmd(args):
     if args.action == 'up':
-        name = new_id()
-        if not admit('vm', name, 'vm'):
-            raise SystemExit('coldbox: the host is at its job VM ceiling; try again when a job finishes')
+        try:
+            policy = fleet()
+        except RuntimeError as error:
+            raise SystemExit(f'coldbox: {error}') from error
+        if policy and policy[0] == os.uname().nodename:
+            raise SystemExit(f'coldbox: this host is the CI primary in {CI_HOSTS}; run ad-hoc VMs on another host')
+        name, refusal = new_id(), 'coldbox: the host is at its job VM ceiling; try again when a job finishes'
+        try:
+            admitted = admit('vm', name, 'vm')
+        except SystemExit as limit:
+            admitted, refusal = False, str(limit)
+        if not admitted:
+            command = ['coldbox', 'vm', 'up', '--here', '--ttl', str(args.ttl)] + ['--offline'] * args.offline
+            tags = collections.Counter(map(host_tag, [os.uname().nodename, *adhoc_peers()]))
+            peers = [] if args.here else [peer for peer in adhoc_peers() if tags[host_tag(peer)] == 1]
+            ranked = least_loaded(peers, None)
+            for host in ranked + [peer for peer in peers if peer not in ranked]:
+                started = subprocess.run(ssh(host, command), stdout=subprocess.PIPE, text=True)
+                if started.returncode == 0:
+                    print(f'coldbox: {refusal.removeprefix("coldbox: ")}; started it on {host}', file=sys.stderr)
+                    print(started.stdout.strip())
+                    return 0
+            raise SystemExit(refusal)
         try:
             boot(name, int(time.time() + args.ttl), args.offline, '--config', f'{ADHOC}=true')
         except BaseException:
@@ -654,7 +1304,13 @@ def vm_cmd(args):
             print(f"{vm['name']}\t{vm['status']}\texpires in {max(0, left) / 60:.0f} min")
         return 0
     if args.name not in vms:
-        raise SystemExit(f'coldbox: no ad-hoc VM named {args.name}; see coldbox vm list')
+        tag = args.name.split('-', 3)[3:]
+        homes = [peer for peer in adhoc_peers() if tag == [host_tag(peer)]]
+        if len(homes) != 1 or tag == [host_tag(os.uname().nodename)]:
+            raise SystemExit(f'coldbox: no ad-hoc VM named {args.name}; see coldbox vm list')
+        home = homes[0]
+        forwarded = ['coldbox', 'vm', args.action, args.name] + (['--', *args.command] if args.action == 'exec' else [])
+        return subprocess.run(ssh(home, forwarded)).returncode
     if args.action == 'down':
         gone = destroy(args.name)
         print(f"coldbox: {args.name} {'deleted' if gone else 'FAILED to delete'}", file=sys.stderr)
@@ -665,13 +1321,208 @@ def vm_cmd(args):
     return subprocess.run(ic_exec(args.name, *args.command, cwd=f'/home/{RUNNER}', timeout=left)).returncode
 
 
-def gh(*args, body=None):
+def app_jwt(app_id, key=None):
+    encode = lambda value: base64.urlsafe_b64encode(value).rstrip(b'=')
+    now = int(time.time())
+    payload = {'iat': now - 60, 'exp': now + 540, 'iss': app_id}
+    message = b'.'.join(encode(json.dumps(value).encode())
+                        for value in ({'alg': 'RS256', 'typ': 'JWT'}, payload))
+    signed = subprocess.run(['openssl', 'dgst', '-sha256', '-sign', str(key or APP_KEY)], input=message,
+                            capture_output=True, timeout=30)
+    if signed.returncode:
+        raise RuntimeError('GitHub App: RS256 signing failed; check private key access')
+    return (message + b'.' + encode(signed.stdout)).decode()
+
+
+def app_request(path, jwt, method='GET', body=None):
+    request = urllib.request.Request(f'https://api.github.com/{path}', method=method,
+                                    data=json.dumps(body or {}).encode() if method == 'POST' else None,
+                                    headers={'Authorization': f'Bearer {jwt}', 'User-Agent': 'coldbox',
+                                             'Accept': 'application/vnd.github+json',
+                                             'X-GitHub-Api-Version': '2022-11-28'})
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return json.load(response)
+
+
+def app_token(path='', scope=None):
+    try:
+        config = dict(line.strip().split('=', 1) for line in APP_ENV.read_text().splitlines()
+                      if line.strip().startswith('COLDBOX_GITHUB_APP_ID=')) if APP_ENV.exists() else {}
+        app_id = os.environ.get('COLDBOX_GITHUB_APP_ID') or config.get('COLDBOX_GITHUB_APP_ID')
+        if not app_id or not APP_KEY.exists():
+            return None
+        if not app_id.isdecimal():
+            raise RuntimeError('GitHub App: COLDBOX_GITHUB_APP_ID must be numeric')
+        match = re.match(r'(?:repos|orgs|users)/([^/?]+)', path)
+        owner = match[1].casefold() if match else ''
+        with APP_LOCK:
+            cache_key = (app_id, owner, json.dumps(scope))
+            cached = APP_TOKENS.get(cache_key)
+            if cached and time.time() < cached[1] - 300:
+                return cached[0]
+            jwt = app_jwt(app_id)
+            installations, page = [], 1
+            while True:
+                batch = app_request(f'app/installations?per_page=100&page={page}', jwt)
+                installations.extend(batch)
+                if len(batch) < 100:
+                    break
+                page += 1
+            matches = [item for item in installations if not owner or item['account']['login'].casefold() == owner]
+            if not matches or owner and len(matches) != 1:
+                raise RuntimeError('GitHub App: no unique installation for the target owner')
+            token = app_request(f"app/installations/{matches[0]['id']}/access_tokens", jwt, 'POST', scope)
+            expires = datetime.fromisoformat(token['expires_at'].replace('Z', '+00:00')).timestamp()
+            if not isinstance(token['token'], str) or not token['token'] or expires <= time.time() + 300:
+                raise RuntimeError('GitHub App: invalid or expired installation token')
+            APP_TOKENS[cache_key] = token['token'], expires
+            return token['token']
+    except urllib.error.HTTPError as error:
+        kind = GitHubTransient if 500 <= error.code < 600 else RuntimeError
+        raise kind(f'GitHub App authentication failed: HTTP {error.code}') from None
+    except (urllib.error.URLError, TimeoutError, ConnectionError):
+        raise GitHubTransient('GitHub App authentication failed: network error') from None
+    except RuntimeError:
+        raise
+    except Exception:
+        raise RuntimeError('GitHub App authentication failed; check configuration, key and connectivity') from None
+
+
+def repo_token(repo):
+    try:
+        token = app_token(f'repos/{repo}', dict(repositories=[repo.split('/')[1]], permissions=dict(contents='read')))
+    except RuntimeError as error:
+        if 'HTTP 422' not in str(error) and 'no unique installation' not in str(error):
+            raise
+        token = None
+    if token is None:
+        print(f'coldbox: no GitHub App token can read {repo} (the App needs Contents: read on that repo); '
+              'cloning anonymously, which works only for public repos', file=sys.stderr, flush=True)
+    return token
+
+
+APP_PERMISSIONS = dict(administration='write', actions='read', metadata='read')
+ORG_APP_PERMISSIONS = dict(APP_PERMISSIONS, organization_self_hosted_runners='write')
+
+
+def setup_app(args):
+    if args.app_id is None and args.key is None:
+        query = urllib.parse.urlencode(dict(name=f'coldbox-{os.uname().nodename}', url='https://github.com/TayHCode/coldbox',
+                                            public='false', webhook_active='false',
+                                            **(ORG_APP_PERMISSIONS if args.org else APP_PERMISSIONS)))
+        owner = f'organizations/{urllib.parse.quote(args.org)}/settings' if args.org else 'settings'
+        print(f'1. Open https://github.com/{owner}/apps/new?{query}')
+        print('   The form is filled in with only the permissions Coldbox needs. Click "Create GitHub App".')
+        print('2. Note the App ID, then click "Generate a private key" and copy the .pem file to this host.')
+        print(f"3. sudo coldbox setup-app{f' --org {args.org}' if args.org else ''} --app-id <App ID> --key <path to .pem>")
+        return 0
+    if args.app_id is None or args.key is None:
+        raise ConfigError('setup-app: give both --app-id and --key, or neither to print the setup steps')
+    if not args.app_id.isdecimal():
+        raise ConfigError('setup-app: --app-id must be the numeric App ID')
+    if os.geteuid() != 0:
+        raise SystemExit('coldbox setup-app: run with sudo')
+    if APP_KEY.exists() or APP_ENV.exists():
+        raise ConfigError(f'setup-app: GitHub App auth is already configured; remove {APP_KEY} and {APP_ENV} to replace it')
+    key = Path(args.key)
+    try:
+        app = app_request('app', app_jwt(args.app_id, key))
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(f'setup-app: GitHub rejected App ID {args.app_id} with this key (HTTP {error.code})') from None
+    except (urllib.error.URLError, TimeoutError, ConnectionError):
+        raise RuntimeError('setup-app: could not reach api.github.com') from None
+    granted = app.get('permissions', {})
+    wanted = ORG_APP_PERMISSIONS if args.org else APP_PERMISSIONS
+    extra = sorted(f'{name}:{level}' for name, level in granted.items()
+                   if level not in {'read': ('read',), 'write': ('read', 'write')}.get(wanted.get(name), ()))
+    missing = sorted(f'{name}:{level}' for name, level in wanted.items()
+                     if granted.get(name) != level)
+    if extra or missing:
+        raise ConfigError('setup-app: change the App\'s permissions in its settings and run this again: '
+                          + '; '.join(f"{label} {', '.join(items)}" for label, items in
+                                      (('remove', extra), ('add', missing)) if items))
+    owner = pwd.getpwnam(os.environ.get('SUDO_USER') or 'root')
+    APP_KEY.parent.mkdir(parents=True, exist_ok=True)
+    pem = key.read_bytes()
+    descriptor = os.open(APP_KEY, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, 'wb') as out:
+            out.write(pem)
+        os.chown(APP_KEY, owner.pw_uid, owner.pw_gid)
+        APP_ENV.write_text(f'COLDBOX_GITHUB_APP_ID={args.app_id}\n')
+        APP_ENV.chmod(0o644)
+    except BaseException:
+        APP_KEY.unlink(missing_ok=True)
+        APP_ENV.unlink(missing_ok=True)
+        raise
+    print(f"GitHub App {app['slug']} configured: {APP_KEY} (mode 600, owner {owner.pw_name}) and {APP_ENV}")
+    print(f"Next: install it on the repos to register at https://github.com/apps/{app['slug']}/installations/new")
+    return 0
+
+
+def gh_env(path=''):
+    token = app_token(path)
+    return dict(os.environ, GH_TOKEN=token, GH_HOST='github.com') if token else None
+
+
+def gh(*args, body=None, _retries=None):
     command = ['gh', 'api', *args] + (['--input', '-'] if body is not None else [])
-    result = subprocess.run(command, input=json.dumps(body) if body is not None else None, capture_output=True,
-                            text=True)
-    if result.returncode:
-        raise RuntimeError(f'gh api {" ".join(args)}: {result.stderr.strip() or result.stdout.strip()}')
-    return json.loads(result.stdout) if result.stdout.strip() else None
+    path = next((arg for arg in args if arg.startswith(('repos/', 'orgs/', 'users/'))), '')
+    retries = [4] if _retries is None else _retries
+    pending_jit = False
+    runner_delete = '-X' in args and 'DELETE' in args and '/actions/runners/' in path
+    ambiguous_delete = False
+    while True:
+        sent = False
+        try:
+            if pending_jit:
+                reconcile_jit(path.removesuffix('/generate-jitconfig'), body['name'], retries)
+                pending_jit = False
+            env = gh_env(path)
+            try:
+                sent = True
+                result = subprocess.run(command, env=env, input=json.dumps(body) if body is not None else None,
+                                        capture_output=True, text=True, timeout=60)
+            except subprocess.TimeoutExpired:
+                raise GitHubTransient('GitHub request timed out') from None
+            if not result.returncode:
+                return json.loads(result.stdout) if result.stdout.strip() else None
+            detail = result.stderr.strip() or result.stdout.strip()
+            status = re.search(r'HTTP ([0-9]{3})', detail)
+            if status and status[1] == '404' and runner_delete and ambiguous_delete:
+                return None
+            transient = (500 <= int(status[1]) < 600) if status else bool(re.search(
+                r'(?i)no server is currently available|dial tcp|timeout|timed out|connection reset|'
+                r'connection refused|\bEOF\b|TLS handshake|network is unreachable|temporary failure|error connecting', detail))
+            if env:
+                detail = f"GitHub App request failed: {status[0] if status else 'unknown HTTP status'}"
+            kind = GitHubTransient if transient else RuntimeError
+            raise kind(f'gh api {" ".join(args)}: {detail}')
+        except GitHubTransient:
+            ambiguous_delete = ambiguous_delete or sent and runner_delete
+            if sent and path.endswith('/generate-jitconfig') and body is not None:
+                pending_jit = True
+            if not retries[0]:
+                if sent and pending_jit:
+                    reconcile_jit(path.removesuffix('/generate-jitconfig'), body['name'], retries)
+                raise
+            delay = 2 ** (4 - retries[0])
+            retries[0] -= 1
+            time.sleep(delay)
+
+
+def reconcile_jit(path, name, retries):
+    page = 1
+    while True:
+        runners = gh(f'{path}?per_page=100&page={page}', _retries=retries)['runners']
+        for runner in runners:
+            if runner['name'] == name:
+                if runner['busy']:
+                    raise RuntimeError(f'cannot retry JIT registration: runner {name} is busy')
+                gh('-X', 'DELETE', f"{path}/{runner['id']}", _retries=retries)
+        if len(runners) < 100:
+            return
+        page += 1
 
 
 def scope(target):
@@ -681,21 +1532,58 @@ def scope(target):
 
 
 def guard(target, allow_public):
+    """Refuse a target Coldbox must not serve. For an opted-in public repo, return the users whose jobs run without
+    approval; for a private one, None."""
     if '/' in target:
         repo = gh(scope(target))
         if str(repo.get('full_name')).casefold() != target.casefold():
             raise SystemExit(f"coldbox: refusing: {target} now resolves to {repo.get('full_name')}")
-        public = repo['visibility'] != 'private'
+        if repo['visibility'] == 'private':
+            return None
         what = f'{target} is not a private repository'
     else:
-        public = gh(f'orgs/{target}/actions/runner-groups/1')['allows_public_repositories']
+        if not gh(f'orgs/{target}/actions/runner-groups/1')['allows_public_repositories']:
+            return None
         what = f"org {target}'s default runner group allows public repositories"
-    if public and not allow_public:
-        raise SystemExit(f'coldbox: refusing: {what}. Fork pull requests on public repositories can run code on '
-                         'this machine. Pass --allow-public only if you accept that.')
+    if not allow_public:
+        raise SystemExit(f'coldbox: refusing: {what}. On a public repository anyone can open a pull request. Pass '
+                         '--allow-public to serve it: jobs from users with write access then run at once, and '
+                         "everyone else's pull requests wait until you approve them on GitHub.")
+    if '/' not in target:
+        raise SystemExit('coldbox: refusing: --allow-public is per repository; register OWNER/REPO')
+    try:
+        return public_writers(gh, target, repo)
+    except ValueError as error:
+        raise SystemExit(f'coldbox: refusing: {error}') from None
+
+
+def public_writers(get, target, repo):
+    if (repo.get('owner') or {}).get('type') != 'User':
+        raise Unsafe(f'{target} is owned by an organization, whose members can skip GitHub\'s approval of '
+                         'outside pull requests; --allow-public serves only repos owned by a user account')
+    policy = get(f'repos/{target}/actions/permissions/fork-pr-contributor-approval').get('approval_policy')
+    if policy != APPROVAL:
+        raise Unsafe(f'{target} runs some outside pull requests without approval (approval_policy {policy}). '
+                     f'Fix: gh api -X PUT repos/{target}/actions/permissions/fork-pr-contributor-approval '
+                     f'-f approval_policy={APPROVAL}')
+    writers, page = [], 1
+    while True:
+        batch = get(f'repos/{target}/collaborators?permission=push&per_page=100&page={page}')
+        writers += [user['login'] for user in batch]
+        if len(batch) < 100:
+            return sorted(writers)
+        page += 1
 
 
 def stop_once(*_):
+    if not DRAINING.is_set() and ACTIVE_LOG is not None:
+        try:
+            log = ACTIVE_LOG.read_bytes()
+        except OSError:
+            log = b''
+        if running_job(log) and job_outcome(log) == (None, None):
+            DRAINING.set()
+            return
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     sys.exit(143)
 
@@ -705,7 +1593,8 @@ def exit_code(receipt):
 
 
 def worker_argv(args, *extra):
-    argv = [sys.executable, str(Path(__file__).resolve()), 'serve', args.target, '--worker', '--ttl', str(args.ttl)]
+    argv = [sys.executable, str(Path(__file__).resolve()), 'serve', args.target, '--worker', '--ttl', str(args.ttl),
+            '--slots', str(min(args.slots, 1))]
     return argv + ['--allow-public'] * args.allow_public + ['--allow-forks'] * args.allow_forks + list(extra)
 
 
@@ -722,15 +1611,17 @@ def serve_slots(args):
     next_pass = 0
     while not STOPPING.is_set() and all(child.poll() is None for child in children):
         if github and time.time() >= next_pass:
-            next_pass = time.time() + AUTOSCALE_SECONDS
+            started = time.time()
+            next_pass = started + AUTOSCALE_SECONDS
             try:
-                autoscale(github, args, bursts)
+                next_pass = started + autoscale(github, args, bursts)
             except (OSError, RuntimeError, ValueError, KeyError, subprocess.SubprocessError) as error:
                 print(f'coldbox: autoscale pass failed: {type(error).__name__}: {error}', file=sys.stderr, flush=True)
         time.sleep(1)
-    for child in children + bursts:
-        if child.poll() is None:
-            child.send_signal(signal.SIGTERM)
+    if not STOPPING.is_set():
+        for child in children + bursts:
+            if child.poll() is None:
+                child.send_signal(signal.SIGTERM)
     return max((child.wait() for child in children + bursts), default=143) or 1
 
 
@@ -754,35 +1645,55 @@ def idle_released(*_):
 
 
 def serve(args):
+    _, primary = ci_host()
     if not args.worker and (args.slots > 1 or not args.once):
         return serve_slots(args)
     signal.signal(signal.SIGTERM, stop_once)
     signal.signal(signal.SIGUSR1, idle_released)
-    env = ['ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/coldbox-job-started.sh']
+    env = ['ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/coldbox-job-started.sh',
+           f'COLDBOX_CI_PRIMARY={primary}']
     if args.allow_forks:
         env.append('COLDBOX_ALLOW_FORKS=1')
+    memory, limits = vm_shape(args.size)
+    labels = runner_labels(args.size)
     while True:
-        guard(args.target, args.allow_public)
+        writers = guard(args.target, args.allow_public)
         name = args.name or new_id()
         if args.idle:
-            note_worker(os.getpid(), args.target, name, 'burst')
-        elif not admit(args.target, name, 'base' if args.worker and not args.once else 'once'):
+            note_worker(os.getpid(), args.target, name, 'burst', writers, memory)
+        elif not admit(args.target, name, 'base' if args.worker and not args.once else 'once', writers, memory):
             if args.once:
                 raise SystemExit('coldbox: the host is at its job VM ceiling; not starting another')
             print('coldbox: the host is at its job VM ceiling; waiting', file=sys.stderr, flush=True)
             time.sleep(30)
             continue
-        runner = gh('-X', 'POST', f'{scope(args.target)}/actions/runners/generate-jitconfig',
-                    body=dict(name=name, runner_group_id=1, labels=LABELS, work_folder='_work'))
+        if not args.once and compile(Path(__file__).read_bytes(), __file__, 'exec') != LOADED_CODE:
+            extra = (['--idle', str(args.idle)] if args.idle else []) + (['--name', args.name] if args.name else []) + \
+                (['--size', args.size] if args.size != 'default' else [])
+            os.execv(sys.executable, worker_argv(args, *extra))
+        admission = runner_admission(args.target, name, time.time() + args.ttl)
+        (STATE / 'receipts').mkdir(parents=True, exist_ok=True)
+        marker = STATE / 'receipts' / f'{name}.registered'
+        marker.touch()
+        try:
+            runner = gh('-X', 'POST', f'{scope(args.target)}/actions/runners/generate-jitconfig',
+                        body=dict(name=name, runner_group_id=1, labels=labels, work_folder='_work'))
+        except GitHubTransient:
+            raise
+        except RuntimeError:
+            marker.unlink(missing_ok=True)
+            raise
         idle = threading.Timer(args.idle, release_idle, (args.target, runner['runner']['id'])) if args.idle else None
         try:
             if idle:
                 idle.daemon = True
-                idle.start()
             print(f'coldbox: runner {name} waiting for a job on {args.target}', file=sys.stderr, flush=True)
             receipt = job('runner', name, args.ttl, ['sh', '-c', 'read -r c; exec ./run.sh --jitconfig "$c"'],
                           repo=args.target, stdin=(runner['encoded_jit_config'] + '\n').encode(),
-                          cwd='/opt/actions-runner', env=env, extra=dict(runner_id=runner['runner']['id']))
+                          cwd='/opt/actions-runner',
+                          env=env + ([f"COLDBOX_PUBLIC_WRITERS={','.join(writers)}"] if writers is not None else []),
+                          extra=dict(runner_id=runner['runner']['id'], admission=admission),
+                          on_ready=idle.start if idle else None, config=incus_config(limits))
         finally:
             if idle:
                 idle.cancel()
@@ -790,6 +1701,8 @@ def serve(args):
                 gh('-X', 'DELETE', f"{scope(args.target)}/actions/runners/{runner['runner']['id']}")
             except RuntimeError:
                 pass
+        if DRAINING.is_set():
+            return 143
         if args.once:
             return exit_code(receipt)
         if 'job_seconds' not in receipt:
@@ -804,7 +1717,7 @@ class GitHub:
     def get(self, path):
         if self.remaining is not None and self.remaining < QUOTA_RESERVE and time.time() < self.reset:
             raise RuntimeError(f'GitHub API quota low ({self.remaining} left); waiting for its reset')
-        token = subprocess.run(['gh', 'auth', 'token'], capture_output=True, text=True, check=True,
+        token = app_token(path) or subprocess.run(['gh', 'auth', 'token'], capture_output=True, text=True, check=True,
                                timeout=60).stdout.strip()
         headers = {'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.github+json',
                    'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'coldbox'}
@@ -845,55 +1758,299 @@ def listing(github, path, key):
         page += 1
 
 
+def runner_labels(size):
+    return LABELS if size == 'default' else LABELS[:-1] + [f'coldbox-{size}']
+
+
+def job_size(labels):
+    labels = {label.casefold() for label in labels}
+    return next((size for size in SIZES if labels and labels <= set(runner_labels(size))), None)
+
+
 def runs_here(labels):
-    return bool(labels) and {label.casefold() for label in labels} <= set(LABELS)
+    return job_size(labels) is not None
 
 
-def queued_jobs(github, repo, older_than=0):
-    runs = [run for status in ('queued', 'in_progress')
+def queued_jobs(github, repo, older_than=0, writers=None):
+    runs = [run for status in ('queued', 'in_progress', 'pending')
             for run in listing(github, f'repos/{repo}/actions/runs?status={status}&', 'workflow_runs')]
-    cutoff = time.time() - older_than
-    return sum(job['status'] == 'queued' and runs_here(job['labels']) and (not older_than or queued_at(job) <= cutoff)
-               for run in runs for job in listing(github, f"repos/{repo}/actions/runs/{run['id']}/jobs?", 'jobs'))
+    if writers is not None:
+        runs = [run for run in runs if not held(run, repo, writers)]
+    now = time.time()
+    jobs = [job for run in runs
+            for job in listing(github, f"repos/{repo}/actions/runs/{run['id']}/jobs?", 'jobs')
+            if job['status'] == 'queued' and runs_here(job['labels'])]
+    eligible = [job for job in jobs if not older_than or queued_at(job) <= now - older_than]
+    oldest = max((max(0, now - queued_at(job)) for job in eligible if job.get('created_at')), default=0)
+    return len(eligible), int(oldest), collections.Counter(job_size(job['labels']) for job in eligible)
+
+
+def observe_queue(github, repo, writers=None):
+    threshold = int(os.environ.get('COLDBOX_QUEUE_STALL_SECONDS', '300'))
+    if threshold <= 0:
+        raise ValueError('COLDBOX_QUEUE_STALL_SECONDS must be positive')
+    count, oldest, sizes = queued_jobs(github, repo, writers=writers)
+    path = STATE / 'queues' / f'{repo}.json'
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            previous = json.loads(path.read_text())
+        except (FileNotFoundError, ValueError):
+            previous = {}
+        stalled = bool(count) and oldest >= threshold
+        observation = dict(queued=count, oldest_wait_seconds=oldest, stalled=stalled,
+                           observed_at=now_iso(), threshold_seconds=threshold)
+        write_json(path, observation)
+        if stalled != previous.get('stalled', False):
+            print(f"coldbox: queue {'STALLED' if stalled else 'CLEARED'} on {repo}; "
+                  f'{count} queued job(s); oldest waited {oldest} s', file=sys.stderr, flush=True)
+    except OSError as error:
+        print(f'coldbox: queue observation unavailable on {repo}: {error}', file=sys.stderr, flush=True)
+    return count, oldest, sizes
+
+
+def held(run, repo, writers):
+    head = (run.get('head_repository') or {}).get('full_name') or ''
+    actor = (run.get('triggering_actor') or run.get('actor') or {}).get('login')
+    why = outsider(run.get('event'), head.casefold() != repo.casefold(), actor, writers)
+    if why:
+        print(f"coldbox: not scaling for run {run['id']} on {repo}: {why}", file=sys.stderr, flush=True)
+    return why
 
 
 def queued_at(job):
     return datetime.fromisoformat(job['created_at'][:19]).replace(tzinfo=timezone.utc).timestamp()
 
 
-def standby_seconds():
+def host_setting(path, unit):
     try:
-        text = STANDBY.read_text().strip()
+        text = path.read_text().strip()
     except FileNotFoundError:
         return 0
     if not text.isdigit():
-        raise ValueError(f'{STANDBY} must hold a whole number of seconds, not {text!r}')
+        raise ValueError(f'{path} must hold a whole number of {unit}, not {text!r}')
     return int(text)
 
 
-def burst_count(wanted, running, cpus, cores, load, available, total, vm_memory):
-    """How many burst VMs to start: one per queued job, within a ceiling of one VM per CPU thread and per VM-sized
-    share of RAM, and only while physical cores are free and RAM is available now."""
-    ceiling = min(cpus, (total - HOST_RESERVE) // vm_memory)
-    room = min(ceiling - running, int(cores - load), (available - HOST_RESERVE) // vm_memory)
-    return max(0, min(wanted, room))
+def host_cpu_load():
+    cpus = os.cpu_count()
+    try:
+        samples = []
+        for index in range(2):
+            if index:
+                time.sleep(1)
+            fields = Path('/proc/stat').read_text().splitlines()[0].split()
+            if fields[0] != 'cpu' or len(fields) < 9:
+                raise ValueError('invalid aggregate CPU counters')
+            counters = [int(value) for value in fields[1:9]]
+            if any(value < 0 for value in counters):
+                raise ValueError('negative CPU counter')
+            samples.append(counters)
+        delta = [end - start for start, end in zip(*samples)]
+        total = sum(delta)
+        if any(value < 0 for value in delta) or not total:
+            raise ValueError('invalid CPU counter delta')
+        return cpus * (1 - delta[3] / total)
+    except (OSError, ValueError, IndexError):
+        return max(os.getloadavg()[0], cpus)
 
 
-def physical_cores():
+def ramp_room(add, running, now=None):
     try:
-        online = (CPUS / 'online').read_text().strip()
+        cap = json.loads((STATE / 'ramp-cap.json').read_text())
     except FileNotFoundError:
-        return os.cpu_count() or 1
-    if not re.fullmatch(r'\d+(-\d+)?(,\d+(-\d+)?)*', online):
-        raise ValueError(f'{CPUS / "online"} is not a CPU list: {online!r}')
-    ranges = [(int(first), int(last or first)) for first, _, last in (part.partition('-') for part in online.split(','))]
-    if any(last < first for first, last in ranges):
-        raise ValueError(f'{CPUS / "online"} has a reversed range: {online!r}')
-    cpus = [cpu for first, last in ranges for cpu in range(first, last + 1)]
+        return add
+    except (OSError, ValueError) as error:
+        raise ValueError(f"invalid ramp cap: {STATE / 'ramp-cap.json'}") from error
+    if (not isinstance(cap, dict) or type(cap.get('limit')) is not int or cap['limit'] < 0
+            or ('expires' not in cap)
+            or (cap['expires'] is None and not re.fullmatch(r'[a-f0-9]{64}', str(cap.get('evidence', ''))))
+            or (cap['expires'] is not None and (type(cap['expires']) not in (int, float)
+                                              or not math.isfinite(cap['expires'])))):
+        raise ValueError(f"invalid ramp cap: {STATE / 'ramp-cap.json'}")
+    if cap['expires'] is not None and cap['expires'] <= (time.time() if now is None else now):
+        return add
+    return max(0, min(add, cap['limit'] - running))
+
+
+def rooms(vms, cpus, load, available, floor, vm_memory, reserve=0, ceiling=math.inf):
+    """The one admission rule, for every job VM on every host: room for more VMs by each check. ceiling is how many
+    more fit when every job VM, idle or busy, uses CORES_PER_JOB of the threads left after the reserve and grows to
+    its full memory; an idle VM that takes a job only changes state, so a rush of jobs onto idle VMs never passes
+    it. available is real MemAvailable less VMs still booting. The load already counts the other work, so the
+    reserve only caps the VMs."""
+    return dict(ceiling=min((cpus - reserve) // CORES_PER_JOB - vms, ceiling), memory=(available - floor) // vm_memory,
+                load=int(cpus - load))
+
+
+def burst_count(wanted, room):
+    """How many job VMs to start for wanted queued jobs under the admission rule."""
+    return max(0, min(wanted, *room.values()))
+
+
+def declined(room):
+    return min(room, key=room.get)
+
+
+HOST_PROBE = """
+import argparse, json, os, runpy, time
+c = runpy.run_path('/usr/local/bin/coldbox')
+if requested_target is not None and not any(
+        r['target'].casefold() == requested_target.casefold() and r['active'] == 'active'
+        for r in c['registrations']()):
+    raise RuntimeError('primary repo service is not active')
+memory = c['vm_memory']()
+samples = []
+for index in range(2):
+    if index:
+        time.sleep(1)
+    fields = c['Path']('/proc/stat').read_text().splitlines()[0].split()
+    if fields[0] != 'cpu' or len(fields) < 9:
+        raise ValueError('invalid CPU counters')
+    samples.append([int(value) for value in fields[1:9]])
+delta = [end - start for start, end in zip(*samples)]
+if any(value < 0 for sample in samples for value in sample) or any(value < 0 for value in delta) or not sum(delta):
+    raise ValueError('invalid CPU delta')
+busy = os.cpu_count() * (1 - delta[3] / sum(delta))
+vms, vm_ceiling = c['vm_room']()
+booting = sum(worker.kind == 'burst' and c['starting'](worker.name, time.time())
+              for worker in c['live_workers'](c['STATE'] / 'workers', prune=False))
+try:
+    ramp_room = c['ramp_room'](vm_ceiling, vms)
+except (OSError, ValueError):
+    ramp_room = None
+print(json.dumps(dict(host=os.uname().nodename, target=requested_target, measured_at=time.time(),
+                      cpus=os.cpu_count(), busy_cpus=busy, available_memory=c['host_memory']('MemAvailable'),
+                      vm_memory=memory, vms=vms, vm_ceiling=vm_ceiling, booting=booting, load_avg=os.getloadavg()[0],
+                      reserve=c['host_setting'](c['RESERVE'], 'CPU threads'), ramp_room=ramp_room)))
+"""
+
+
+CI_HOSTS = Path('/etc/coldbox/ci-hosts.json')
+CI_HOSTS_HELP = ('it must hold {"primary": "<host>", "overflow": ["<host>", ...]} with distinct kernel host names, '
+                 'none in overflow equal to the primary. See https://github.com/TayHCode/coldbox#autoscaling')
+
+
+def fleet():
     try:
-        return len({(CPUS / f'cpu{cpu}' / 'topology' / 'core_cpus_list').read_text() for cpu in cpus})
+        CI_HOSTS.lstat()
     except FileNotFoundError:
-        return len(cpus)
+        return None
+    except OSError as error:
+        raise RuntimeError(f'CI host admission denied: cannot read {CI_HOSTS}: {error}; {CI_HOSTS_HELP}') from error
+    try:
+        policy = json.loads(CI_HOSTS.read_text())
+        primary, overflow = policy['primary'], policy['overflow']
+        if (not isinstance(primary, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', primary)
+                or not isinstance(overflow, list) or len(set(overflow)) != len(overflow)
+                or any(not isinstance(h, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', h)
+                       or h == primary for h in overflow)):
+            raise ValueError('invalid CI hosts')
+        return primary, overflow
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        detail = f'missing key {error}' if isinstance(error, KeyError) else error
+        raise RuntimeError(f'CI host admission denied: cannot read {CI_HOSTS}: {detail}; {CI_HOSTS_HELP}') from error
+
+
+def admitted_fleet():
+    host, policy = os.uname().nodename, fleet()
+    if policy and host != policy[0] and host not in policy[1]:
+        raise RuntimeError(f'CI host admission denied: {host} is not admitted for CI: it is not listed in {CI_HOSTS}; '
+                           f'to run CI here, add it to "overflow"; {CI_HOSTS_HELP}')
+    return host, policy
+
+
+def ci_host():
+    host, policy = admitted_fleet()
+    return host, policy[0] if policy else host
+
+
+def adhoc_peers():
+    try:
+        host, policy = admitted_fleet()
+    except RuntimeError:
+        return []
+    return [peer for peer in policy[1] if peer != host] if policy else []
+
+
+def fresh_evidence(evidence, host, target, at):
+    if not isinstance(evidence, dict):
+        return False
+    fields = ('measured_at', 'cpus', 'busy_cpus', 'load_avg', 'available_memory', 'vm_memory', 'vms', 'vm_ceiling')
+    if any(type(evidence.get(k)) not in (int, float) or not math.isfinite(evidence[k]) for k in fields):
+        return False
+    return (evidence.get('host') == host and evidence.get('target') == target
+            and 0 <= at - evidence['measured_at'] <= 30
+            and evidence['cpus'] > 0 and 0 <= evidence['busy_cpus'] <= evidence['cpus'] and evidence['load_avg'] >= 0
+            and evidence['available_memory'] >= 0 and evidence['vm_memory'] > 0 and evidence['vms'] >= 0)
+
+
+def ssh(host, command):
+    return ['ssh', '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=3', '-o', 'StrictHostKeyChecking=yes',
+            host, shlex.join(command)]
+
+
+def host_evidence(target, host):
+    try:
+        result = subprocess.run(['python3', '-'] if host == os.uname().nodename else ssh(host, ['python3', '-']),
+                                input=f'requested_target = {target!r}\n' + HOST_PROBE,
+                                capture_output=True, text=True, timeout=8, check=True)
+        return json.loads(result.stdout)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def least_loaded(hosts, target):
+    with concurrent.futures.ThreadPoolExecutor(max(len(hosts), 1)) as pool:
+        evidence = list(pool.map(lambda host: host_evidence(target, host), hosts))
+    at, rooms, seen = time.time(), [], []
+    for index, (host, measured) in enumerate(zip(hosts, evidence)):
+        if (fresh_evidence(measured, host, target, at)
+                and all(type(measured.get(k)) is int and measured[k] >= 0 for k in ('reserve', 'ramp_room', 'booting'))
+                and type(measured.get('load_avg')) in (int, float) and 0 <= measured['load_avg'] < math.inf):
+            load = max(measured['busy_cpus'], measured['load_avg'])
+            room = min(int(measured['cpus'] - load - measured['booting']),
+                       int(measured['vm_ceiling'] - measured['vms']), measured['ramp_room'],
+                       int((measured['available_memory'] - HOST_RESERVE) // measured['vm_memory']))
+            seen.append(f"{host} room {room} (busy {measured['busy_cpus']:.1f}, load {measured['load_avg']:.1f}, "
+                        f"booting {measured['booting']}, {measured['vms']}/{measured['vm_ceiling']} VMs, "
+                        f"{measured['cpus']} CPUs)")
+            if room >= 1:
+                rooms.append((-room, index, host))
+        else:
+            seen.append(f'{host} unmeasured')
+    print(f"coldbox: least-load ranking: {'; '.join(seen)}", file=sys.stderr, flush=True)
+    return [host for _, _, host in sorted(rooms)]
+
+
+def runner_admission(target, name, expires):
+    host, primary = ci_host()
+    now = time.time()
+    return dict(schema='coldbox.admission/v1', host=host, primary=primary, target=target,
+                guest=name, admitted_at=now, ttl=int(expires - now), primary_capacity=None)
+
+
+def admission_check(args, env=None):
+    env = os.environ if env is None else env
+    try:
+        record = json.loads(Path('/etc/coldbox/admission.json').read_text())
+        host = Path('/etc/coldbox/host').read_text().strip()
+        if (record['schema'] != 'coldbox.admission/v1' or record['host'] != host
+                or record['primary'] != args.expected_primary
+                or record['guest'] != env['RUNNER_NAME']
+                or not (record['target'].casefold() == env['GITHUB_REPOSITORY'].casefold()
+                        or ('/' not in record['target'] and record['target'].casefold() ==
+                            env['GITHUB_REPOSITORY'].split('/')[0].casefold()))
+                or type(record['admitted_at']) not in (int, float)
+                or not math.isfinite(record['admitted_at'])
+                or time.time() < record['admitted_at']):
+            raise ValueError('admission identity or time mismatch')
+        if type(record['ttl']) is not int or record['ttl'] <= 0 or time.time() - record['admitted_at'] > record['ttl']:
+            raise ValueError('admission outlived its VM TTL')
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise RuntimeError(f'CI admission guard failed: {error}') from error
+    print(json.dumps(record))
+    return 0
 
 
 def process_start(pid):
@@ -903,63 +2060,167 @@ def process_start(pid):
         return None
 
 
-def live_workers(folder):
+def worker_record(record):
+    try:
+        fields = json.loads(record.read_text())
+        target, start, name, kind, *writers = fields if isinstance(fields, list) else ()
+    except (OSError, ValueError, TypeError):
+        return None
+    if len(writers) > 2 or len(writers) == 2 and (type(writers[1]) is not int or writers[1] <= 0):
+        return None
+    return target, start, name, kind, writers
+
+
+def unreadable_live_workers(folder):
+    return [record.name for record in folder.glob('[0-9]*')
+            if process_start(record.name) is not None and worker_record(record) is None]
+
+
+def live_workers(folder, prune=True):
     live = []
     for record in folder.glob('[0-9]*'):
-        try:
-            target, start, name, kind = json.loads(record.read_text())
-        except (OSError, ValueError, TypeError):
-            start = None
-        if start and process_start(record.name) == start:
-            live.append(argparse.Namespace(pid=int(record.name), target=target, name=name, kind=kind))
-        else:
+        running = process_start(record.name)
+        fields = worker_record(record)
+        if fields is None:
+            if prune and running is None:
+                record.unlink(missing_ok=True)
+            continue
+        target, start, name, kind, writers = fields
+        if start and running == start:
+            live.append(argparse.Namespace(pid=int(record.name), target=target, name=name, kind=kind,
+                                           writers=writers[0] if writers else None,
+                                           memory=writers[1] if len(writers) > 1 else None))
+        elif prune:
             record.unlink(missing_ok=True)
     return live
 
 
-def note_worker(pid, target, name, kind):
+def note_worker(pid, target, name, kind, writers=None, memory=None):
     folder = STATE / 'workers'
     folder.mkdir(parents=True, exist_ok=True)
     staged = folder / f'.{pid}.{os.getpid()}'
-    staged.write_text(json.dumps([target, process_start(pid), name, kind]))
+    staged.write_text(json.dumps([target, process_start(pid), name, kind, writers] + ([memory] if memory else [])))
     os.replace(staged, folder / str(pid))
 
 
+def orphan(vm, live):
+    return vm['name'] not in live and (vm.get('config') or {}).get(ADHOC) != 'true'
+
+
+def past_ttl(receipt, now):
+    try:
+        ttl = receipt['vm']['ttl_seconds']
+        if type(ttl) is not int or ttl < 0:
+            return True
+        return at(receipt['started_at']) + ttl < now
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return True
+
+
+def unreconciled(live):
+    for path in sorted((STATE / 'receipts').glob('cbx-*.json')):
+        try:
+            receipt = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(receipt, dict) and isinstance(receipt.get('vm'), dict) and isinstance(receipt.get('id'), str) \
+                and receipt['vm'].get('destroyed') is False and receipt['id'] not in live:
+            yield path, receipt
+
+
 def host_vms():
-    return {vm['name'] for vm in json.loads(ic('list', '--format', 'json')) if vm['name'].startswith('cbx-')}
+    rows = json.loads(ic('list', '--format', 'json', '--columns', 'n'))
+    return {vm['name'] for vm in rows if vm['name'].startswith('cbx-')}
 
 
-def host_load(workers, skip=None):
-    vms = host_vms()
-    orphans = len(vms - {worker.name for worker in workers})
-    counted = [worker for worker in workers if not (worker.target == skip and worker.kind == 'base')]
-    started = collections.Counter(worker.target for worker in workers if worker.kind == 'base')
-    pending = sum(max(0, r['slots'] - started[r['target']]) for r in registrations()
-                  if (r.get('configured') or r['active'] not in IDLE_UNIT) and r['target'] != skip)
-    return orphans + len(counted) + pending
+def waiting(worker):
+    if worker.kind != 'base':
+        return False
+    try:
+        return not running_job((STATE / 'receipts' / f'{worker.name}.log').read_bytes())
+    except FileNotFoundError:
+        return True
 
 
-def additional_vm_memory(workers, memory):
-    owned = host_vms() | {worker.name for worker in workers}
+def holds_slots(registration):
+    return registration.get('configured') or registration['active'] not in IDLE_UNIT
+
+
+def host_load(workers):
+    """Count this host's job VMs as (busy, warm). Warm ones are slot VMs still waiting for a job; every other Coldbox
+    VM is busy."""
+    return capacity_used(workers), sum(map(waiting, workers))
+
+
+def vm_bytes(worker, memory):
+    return getattr(worker, 'memory', None) or memory
+
+
+def additional_vm_memory(workers, memory, vms=None):
+    sizes = {worker.name: vm_bytes(worker, memory) for worker in workers}
+    owned = (host_vms() if vms is None else vms) | set(sizes)
     committed = 0
     for vm in query('/1.0/instances?recursion=1&all-projects=true'):
         if vm['type'] != 'virtual-machine' or vm['status'] != 'Running':
             continue
-        counted = memory if vm['project'] == PROJECT and vm['name'] in owned else 0
+        counted = sizes.get(vm['name'], memory) if vm['project'] == PROJECT and vm['name'] in owned else 0
         limit = (vm.get('expanded_config') or {}).get('limits.memory') or (vm.get('config') or {}).get('limits.memory')
         committed += max(0, (size_bytes(limit) if limit else memory) - counted)
     return committed
 
 
-def admit(target, name, kind):
-    me = argparse.Namespace(pid=os.getpid(), target=target, name=name, kind=kind)
+def capacity_used(workers):
+    """Busy job VMs: every Coldbox VM and worker except slot VMs still waiting for a job."""
+    return len(host_vms() - {worker.name for worker in workers}) + len(workers) - sum(map(waiting, workers))
+
+
+def host_room(workers, memory, need, load, reserve, vms=None):
+    """Room for job VMs of need bytes beside workers and every Coldbox VM on this host, by each admission check."""
+    host, vms = host_memory(), host_vms() if vms is None else vms
+    untracked = vms - {worker.name for worker in workers}
+    extra = additional_vm_memory(workers, memory, vms)
+    committed = sum(vm_bytes(worker, memory) for worker in workers) + len(untracked) * memory + extra
+    available = host_memory('MemAvailable') - extra - sum(map(unready, untracked)) * memory - \
+        sum(vm_bytes(worker, memory) for worker in workers if unready(worker.name))
+    return rooms(len(untracked) + len(workers), os.cpu_count(), load, available, memory_floor(host), need, reserve,
+                 (host - host_share(host) - committed) // need)
+
+
+def vm_room():
+    """Count job VMs without the host lock, as (busy, the most busy VMs the admission rule allows now). Workers are
+    read between two VM listings and only VMs in both count, so every counted worker or VM existed when the workers
+    were read."""
+    memory, listed = vm_memory(), host_vms()
+    workers = live_workers(STATE / 'workers', prune=False)
+    vms = listed & host_vms()
+    used = len(vms - {worker.name for worker in workers}) + len(workers) - sum(map(waiting, workers))
+    if storage_refusal():
+        return used, used
+    room = host_room(workers, memory, memory, os.getloadavg()[0], host_setting(RESERVE, 'CPU threads'), vms)
+    return used, used + burst_count(math.inf, room)
+
+
+def admit(target, name, kind, writers=None, memory=None):
+    me = argparse.Namespace(pid=os.getpid(), target=target, name=name, kind=kind, writers=writers, memory=memory)
     with host_lock():
         workers = [worker for worker in live_workers(STATE / 'workers') if worker.pid != me.pid] + [me]
         memory = vm_memory()
-        available = host_memory() - HOST_RESERVE - additional_vm_memory(workers, memory)
-        if host_load(workers) > min(os.cpu_count(), available // memory):
+        if kind == 'vm' and VM_MAX.exists():
+            cap = host_setting(VM_MAX, 'VMs')
+            if len({worker.name for worker in workers if worker.kind == 'vm'} | set(adhoc_vms())) > cap:
+                raise SystemExit(f'coldbox: {cap} ad-hoc VM(s) already running, the limit in {VM_MAX}; '
+                                 'coldbox vm down one first')
+        ci = kind != 'vm'
+        room = host_room([worker for worker in workers if worker is not me], memory, vm_bytes(me, memory),
+                         os.getloadavg()[0] if ci else 0, host_setting(RESERVE, 'CPU threads') if ci else 0)
+        if not burst_count(1, room):
+            print(f'coldbox: no room for a job VM: {declined(room)} ({room})', file=sys.stderr, flush=True)
             return False
-        note_worker(me.pid, target, name, kind)
+        refusal = storage_refusal()
+        if refusal:
+            print(refusal, file=sys.stderr, flush=True)
+            return False
+        note_worker(me.pid, target, name, kind, writers, me.memory)
         return True
 
 
@@ -970,6 +2231,15 @@ def host_lock():
     return lock
 
 
+def unready(name):
+    if (STATE / 'ready' / name).exists():
+        return False
+    try:
+        return not (STATE / 'receipts' / f'{name}.log').stat().st_size
+    except OSError:
+        return True
+
+
 def starting(name, now):
     try:
         return now - int(name.split('-')[1]) < STARTING_SECONDS
@@ -978,52 +2248,115 @@ def starting(name, now):
 
 
 def free_runners(runners, bursts, now):
-    """Runners that can still take a queued job: online and idle, starting up, or a burst not yet on GitHub."""
+    """Runners that can still take a queued job, by size: online and idle, starting up, or a burst not yet on GitHub."""
     listed = {runner['name'] for runner in runners}
-    free = sum(runner['name'].startswith('cbx-') and not runner['busy']
-               and (runner['status'] == 'online' or starting(runner['name'], now)) for runner in runners)
-    return free + sum(burst.name not in listed and starting(burst.name, now) for burst in bursts)
+    free = collections.Counter(job_size(label['name'] for label in runner.get('labels', ())) or 'default'
+                               for runner in runners if runner['name'].startswith('cbx-') and not runner['busy']
+                               and (runner['status'] == 'online' or starting(runner['name'], now)))
+    free.update(getattr(burst, 'size', 'default') for burst in bursts
+                if burst.name not in listed and starting(burst.name, now))
+    return free
 
 
 def autoscale(github, args, bursts):
+    """Start a burst runner for each queued job no free runner can take, and return the seconds to wait before the
+    next pass."""
     folder = STATE / 'workers'
     finished = [burst for burst in bursts if burst.poll() is not None]
     if finished:
         bursts[:] = [burst for burst in bursts if burst not in finished]
         with host_lock():
             live_workers(folder)
-    repo = github.get(f'repos/{args.target}')
-    if repo['full_name'].casefold() != args.target.casefold() or repo['visibility'] != 'private' and not args.allow_public:
-        raise ValueError(f"{args.target} now resolves to {repo['visibility']} {repo['full_name']}; not scaling it")
-    standby, seen = standby_seconds(), queued_jobs(github, args.target)
-    queued = queued_jobs(github, args.target, standby) if standby and seen else seen
-    idle = 0
-    if queued:
+    try:
+        writers = public_rules(github, args)
+    except Unsafe:
+        release_waiting(github, args.target, lambda worker: True)
+        raise
+    release_waiting(github, args.target, lambda worker: worker.writers != writers)
+    reserve = host_setting(RESERVE, 'CPU threads')
+    seen, oldest, sizes = observe_queue(github, args.target, writers=writers)
+    if seen:
+        print(f'coldbox: queue on {args.target}: {seen} queued job(s); oldest waited {oldest} s',
+              file=sys.stderr, flush=True)
+    idle = collections.Counter()
+    if seen:
         runners = listing(github, f'repos/{args.target}/actions/runners?', 'runners')
         idle = free_runners(runners, bursts, time.time())
     github.forget_unused()
-    if seen and not queued:
-        print(f'coldbox: standby host: {seen} job(s) on {args.target} queued under {standby} s are left to the '
-              'primary host; started 0 burst runner(s)', file=sys.stderr, flush=True)
-    if queued <= idle:
-        return
+    wanted = {size: sizes[size] - idle[size] for size in SIZES if sizes[size] > idle[size]}
+    raw_load, cpu_load = (os.getloadavg()[0], host_cpu_load()) if wanted else (0, 0)
+    for size, extra in wanted.items():
+        size_memory, _ = vm_shape(size)
+        with host_lock():
+            workers, memory = live_workers(folder), vm_memory()
+            need = size_memory or memory
+            booting = sum(worker.kind == 'burst' and starting(worker.name, time.time()) for worker in workers)
+            (vms, warm), cpus = host_load(workers), os.cpu_count()
+            load = max(cpu_load, raw_load) + booting
+            room = host_room(workers, memory, need, load, reserve)
+            stopping = STOPPING.is_set()
+            add = 0 if stopping else burst_count(extra, room)
+            refusal = add and storage_refusal()
+            if refusal:
+                print(refusal, file=sys.stderr, flush=True)
+                add = 0
+            uncapped = add
+            add = ramp_room(add, vms)
+            for _ in range(add):
+                name = new_id()
+                burst = subprocess.Popen(worker_argv(args, '--once', '--idle', str(BURST_IDLE_SECONDS), '--name',
+                                                     name, *(['--size', size] if size != 'default' else [])))
+                burst.name, burst.size = name, size
+                note_worker(burst.pid, args.target, name, 'burst', None, size_memory)
+                bursts.append(burst)
+        print(f'coldbox: {sizes[size]} queued job(s) and {idle[size]} idle runner(s) on {args.target}'
+              + (f' for {size} VMs' if size != 'default' else '') +
+              f'; oldest waited {oldest} s; started {add} burst runner(s); host has {vms} busy and {warm} warm job VM(s) and load {load:.1f} on '
+              f'{cpus} CPU threads' + (f' ({reserve} reserved)' if reserve else '') +
+              f'; raw load {raw_load:.1f}; booting {booting}; room {room}; VM memory {need}; stopping {stopping}' +
+              (f'; declined by {declined(room)}' if add < extra and not stopping else '') +
+              (f'; ramp admitted {add} of {uncapped}' if (STATE / 'ramp-cap.json').exists() else ''),
+              file=sys.stderr, flush=True)
+    return AUTOSCALE_SECONDS
+
+
+def public_rules(github, args):
+    repo = github.get(f'repos/{args.target}')
+    if repo['full_name'].casefold() != args.target.casefold() or repo['visibility'] != 'private' and not args.allow_public:
+        raise Unsafe(f"{args.target} now resolves to {repo['visibility']} {repo['full_name']}; not scaling it")
+    return None if repo['visibility'] == 'private' else public_writers(github.get, args.target, repo)
+
+
+def release_waiting(github, target, stale):
+    """Deregister this host's idle runners for target whose worker holds stale approval rules, and wake those workers
+    so they start over with fresh rules. Runs every pass, so a failed delete or a runner registered after the rules
+    changed is caught next time. GitHub refuses to delete a busy runner, so running jobs keep going."""
     with host_lock():
-        workers, memory = live_workers(folder), vm_memory()
-        running = sum(worker.kind == 'burst' for worker in workers)
-        booting = sum(worker.kind == 'burst' and starting(worker.name, time.time()) for worker in workers)
-        vms, cores, load = host_load(workers), physical_cores(), os.getloadavg()[0] + booting
-        add = 0 if STOPPING.is_set() else burst_count(queued - idle, vms, os.cpu_count(), cores, load,
-                                                      host_memory('MemAvailable') - running * memory,
-                                                      host_memory() - additional_vm_memory(workers, memory), memory)
-        for _ in range(add):
-            name = new_id()
-            burst = subprocess.Popen(worker_argv(args, '--once', '--idle', str(BURST_IDLE_SECONDS), '--name', name))
-            burst.name = name
-            note_worker(burst.pid, args.target, name, 'burst')
-            bursts.append(burst)
-    print(f'coldbox: {queued} queued job(s) and {idle} idle runner(s) on {args.target}; '
-          f'started {add} burst runner(s); host has {vms} job VM(s) and load {load:.1f} on {cores} cores',
-          file=sys.stderr, flush=True)
+        pids = {worker.name: worker.pid for worker in live_workers(STATE / 'workers')
+                if worker.target == target and stale(worker)}
+    if not pids:
+        return
+    released = len(release(github, target, pids, len(pids)))
+    print(f'coldbox: released {released} waiting runner(s) on {target} that held out-of-date approval rules; '
+          f'running jobs keep going', file=sys.stderr, flush=True)
+
+
+def release(github, target, pids, limit):
+    """Delete up to limit idle runners of target named in pids and wake their workers, which destroy the VM.
+    GitHub refuses to delete a runner that has taken a job, so a job never loses its runner."""
+    released = []
+    for runner in listing(github, f'{scope(target)}/actions/runners?', 'runners'):
+        if len(released) == limit:
+            break
+        if runner['name'] not in pids or runner['busy']:
+            continue
+        try:
+            gh('-X', 'DELETE', f"{scope(target)}/actions/runners/{runner['id']}")
+            os.kill(pids[runner['name']], signal.SIGUSR1)
+        except (RuntimeError, OSError):
+            continue
+        released.append(runner['name'])
+    return released
 
 
 def instance(target):
@@ -1039,9 +2372,10 @@ def registrations():
         escaped = unit.split('@', 1)[1].removesuffix('.service')
         target = subprocess.run(['systemd-escape', '--unescape', escaped], capture_output=True, text=True).stdout
         conf = Path(f'/etc/systemd/system/{unit}.d/coldbox.conf')
-        match = re.search(r'COLDBOX_SLOTS=(\d+)', conf.read_text()) if conf.exists() else None
+        text = conf.read_text() if conf.exists() else ''
+        match = re.search(r'COLDBOX_SLOTS=(\d+)', text)
         found.append(dict(unit=unit, target=target.strip(), active=active, slots=int(match[1]) if match else 1,
-                          configured=conf.exists()))
+                          configured=conf.exists(), allow_public='COLDBOX_ALLOW_PUBLIC=1\n' in text))
     return found
 
 
@@ -1049,11 +2383,29 @@ def vm_memory():
     return size_bytes(ic('profile', 'get', 'coldbox', 'limits.memory').strip())
 
 
+def vm_disk():
+    return size_bytes(ic('profile', 'device', 'get', 'coldbox', 'root', 'size').strip())
+
+
+def storage_refusal():
+    space = query(f'/1.0/storage-pools/{POOL}/resources')['space']
+    free, disk, reserve = space['total'] - space['used'], vm_disk(), space['total'] // 10
+    if free < disk + reserve:
+        return (f'coldbox: storage pool {POOL} has {free / 2**30:.0f} GiB free, below one {disk / 2**30:g} GiB root '
+                f'disk plus a {reserve / 2**30:.0f} GiB reserve; run coldbox reap, or reinstall with a larger '
+                'COLDBOX_POOL_SIZE')
+    return None
+
+
 def slots_text(slots):
     return f'{slots} job VM slot(s)' if slots else 'burst only: 0 slots, VMs start only for queued jobs'
 
 
 def register(args):
+    ci_host()
+    if args.allow_public and args.allow_forks:
+        raise SystemExit('coldbox: --allow-public and --allow-forks cannot be combined: on a public repo, pull '
+                         'requests from users without write access run only after you approve them on GitHub')
     if args.slots < 0 or args.slots == 0 and '/' not in args.target:
         raise SystemExit('coldbox: --slots must be at least 1 for an org; 0 (burst only) needs OWNER/REPO')
     with host_lock():
@@ -1061,14 +2413,18 @@ def register(args):
 
 
 def register_locked(args):
-    memory, host, cpus = vm_memory(), host_memory(), os.cpu_count()
-    total = args.slots + host_load(live_workers(STATE / 'workers'), skip=args.target)
-    if args.slots and (not fits(total, memory, host) or total > cpus):
-        raise SystemExit(f'coldbox: {total} job VMs of {memory / 2**30:g} GiB, counting running burst '
-                         f'VMs, do not fit in {host / 2**30:.0f} GiB of RAM (2 GiB stays with the host) and '
-                         f'{cpus} CPU threads (one VM each). Use fewer --slots, wait for bursts to finish, or '
-                         'reinstall with a smaller COLDBOX_MEMORY.')
-    guard(args.target, args.allow_public)
+    memory, host, reserve = vm_memory(), host_memory(), host_setting(RESERVE, 'CPU threads')
+    others = sum(r['slots'] for r in registrations() if holds_slots(r) and r['target'] != args.target)
+    limit = slot_limit(memory, host, reserve)
+    if args.slots and others + args.slots > limit:
+        raise SystemExit(f'coldbox: {others + args.slots} slot VMs of {memory / 2**30:g} GiB, counting every '
+                         f'registered slot, plus one {large_memory(memory, host) / 2**30:g} GiB large VM exceed '
+                         f'the ceiling of {host / 2**30:.0f} GiB of RAM ({host_share(host) / 2**30:g} GiB stays '
+                         f'with the host) and {os.cpu_count()} CPU threads ({reserve} reserved, {CORES_PER_JOB} per VM), so a '
+                         f'job no idle slot can take could wait forever. Lower --slots to at most '
+                         f'{max(0, limit - others)}' + ('.' if limit == vm_bound(reserve) - 1 else
+                                                        ' or reinstall with a smaller COLDBOX_MEMORY.'))
+    writers = guard(args.target, args.allow_public)
     unit = f'coldbox-runner@{instance(args.target)}.service'
     dropin = f'[Service]\nEnvironment=COLDBOX_ALLOW_PUBLIC={int(args.allow_public)}\n' \
              f'Environment=COLDBOX_ALLOW_FORKS={int(args.allow_forks)}\nEnvironment=COLDBOX_SLOTS={args.slots}\n'
@@ -1079,7 +2435,11 @@ def register_locked(args):
     subprocess.run(['sudo', 'systemctl', 'enable', unit], check=True)
     subprocess.run(['sudo', 'systemctl', 'restart', '--no-block', unit], check=True)
     print(f'coldbox: {unit} running {slots_text(args.slots)}. '
-          f'Add runs-on: [self-hosted, coldbox] to a workflow in {args.target}.')
+          f'Add runs-on: [self-hosted, coldbox] to a workflow in {args.target}; '
+          'coldbox detect --workflow prints one.')
+    if writers is not None:
+        print(f"coldbox: {args.target} is public. Jobs triggered by {', '.join(writers) or 'nobody'} (write access) "
+              'run at once; pull requests from anyone else run only after you approve them on GitHub.')
     return 0
 
 
@@ -1088,14 +2448,19 @@ def unregister(args):
     subprocess.run(['sudo', 'systemctl', 'disable', '--now', unit], check=False)
     subprocess.run(['sudo', 'rm', '-rf', f'/etc/systemd/system/{unit}.d'], check=True)
     subprocess.run(['sudo', 'systemctl', 'daemon-reload'], check=True)
+    env = gh_env(scope(args.target))
     listed = subprocess.run(['gh', 'api', '--paginate', f'{scope(args.target)}/actions/runners?per_page=100', '--jq',
-                             '.runners[] | select(.name | startswith("cbx-")) | .id'], capture_output=True, text=True)
+                             '.runners[] | select(.name | startswith("cbx-")) | "\\(.id) \\(.name)"'],
+                            capture_output=True, text=True, env=env)
     if listed.returncode:
-        raise RuntimeError(f'gh api runners: {listed.stderr.strip()}')
-    ids = listed.stdout.split()
+        raise RuntimeError('GitHub App runner listing failed' if env else f'gh api runners: {listed.stderr.strip()}')
+    ids = [runner_id for runner_id, name in (line.split(' ', 1) for line in listed.stdout.splitlines())
+           if re.fullmatch(r'cbx-[A-Za-z0-9-]+', name)
+           and any((STATE / 'receipts' / f'{name}{kind}').exists() for kind in ('.json', '.registered'))]
     for runner_id in ids:
         gh('-X', 'DELETE', f'{scope(args.target)}/actions/runners/{runner_id}')
-    print(f'coldbox: stopped {unit}; deleted {len(ids)} coldbox runner registration(s) from {args.target}')
+    print(f'coldbox: stopped {unit}; deleted {len(ids)} coldbox runner registration(s) this host started '
+          f'from {args.target}')
     return 0
 
 
@@ -1106,30 +2471,119 @@ def reap(args):
     except Exception as error:
         failed += 1
         print(f'coldbox reap: FAILED to refresh network ACL: {error}', file=sys.stderr)
-    for vm in json.loads(ic('list', '--format', 'json')):
-        if not vm['name'].startswith('cbx-'):
+    with host_lock():
+        live = {worker.name for worker in live_workers(STATE / 'workers')}
+        unreadable = unreadable_live_workers(STATE / 'workers')
+        listed = json.loads(ic('list', '--format', 'json'))
+        vms = [vm for vm in listed if vm['name'].startswith('cbx-')]
+    if unreadable:
+        print(f"coldbox reap: kept worker-less VMs: cannot read the records of live worker(s) {', '.join(unreadable)}",
+              file=sys.stderr)
+    for vm in vms:
+        if orphan(vm, live) and not unreadable:
+            gone = destroy(vm['name'])
+            failed += not gone
+            print(f"coldbox reap: {vm['name']} has no live worker; {'deleted' if gone else 'FAILED to delete'}")
             continue
         try:
             expires = int((vm.get('config') or {})['user.coldbox.expires'])
         except (KeyError, TypeError, ValueError):
-            print(f"coldbox reap: skipped {vm['name']}: no readable user.coldbox.expires", file=sys.stderr)
-            continue
+            try:
+                expires = int(vm['name'].split('-')[1]) + 86400
+            except (IndexError, ValueError):
+                expires = float('inf')
+            if expires >= time.time():
+                print(f"coldbox reap: skipped {vm['name']}: no readable user.coldbox.expires", file=sys.stderr)
+                continue
         if expires < time.time():
             gone = destroy(vm['name'])
             failed += not gone
             print(f"coldbox reap: {vm['name']} {'deleted' if gone else 'FAILED to delete'}")
+    if any(vm['name'] == 'base-smoke' for vm in listed):
+        try:
+            with open(STATE / 'build-base.lock') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                gone = destroy('base-smoke')
+        except OSError as error:
+            print(f'coldbox reap: skipped base-smoke: build-base lock not free: {error}', file=sys.stderr)
+        else:
+            failed += not gone
+            print(f"coldbox reap: base-smoke left by an interrupted build-base; "
+                  f"{'deleted' if gone else 'FAILED to delete'}")
+    if any(not vm['name'].startswith('cbx-') and vm['name'] != 'base-smoke' for vm in listed):
+        try:
+            with open(STATE / 'build-base.lock') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                failed += reap_bases(json.loads(ic('list', '--format', 'json')))
+        except OSError as error:
+            print(f'coldbox reap: skipped bases: build-base lock not free: {error}', file=sys.stderr)
+    with host_lock():
+        live, present = {worker.name for worker in live_workers(STATE / 'workers')}, host_vms()
+        for path, receipt in unreconciled(live):
+            if receipt['id'] in present:
+                continue
+            receipt['vm'].update(destroyed=True, destroyed_at=now_iso())
+            receipt['reconciled_by'] = 'coldbox reap'
+            settle(receipt)
+            write_json(path, receipt)
+            print(f"coldbox reap: finalized {receipt['id']} receipt as {receipt['verdict']}: VM gone, no live worker")
     if args.keep_days > 0:
         cutoff = time.time() - args.keep_days * 86400
-        old = [path for path in (STATE / 'receipts').glob('cbx-*') if path.stat().st_mtime < cutoff]
+        receipts = STATE / 'receipts'
+        old = [path for path in receipts.glob('cbx-*') if path.is_file() and path.stat().st_mtime < cutoff]
         for path in old:
             path.unlink(missing_ok=True)
+        for folder in receipts.glob('cbx-*.artifacts'):
+            if folder.is_dir() and not (receipts / f"{folder.name.removesuffix('.artifacts')}.json").exists():
+                shutil.rmtree(folder)
         if old:
             print(f'coldbox reap: deleted {len(old)} receipt file(s) older than {args.keep_days} days')
     return int(bool(failed))
 
 
+def rollback_pending():
+    try:
+        return json.loads((STATE / 'base-rollback.json').read_text())['mode'] != 'complete'
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError, KeyError, TypeError):
+        return True
+
+
+def retire_live_base():
+    try:
+        ic('config', 'set', 'base-dev', f'{MANAGED}=true', f'{EXPIRES}={int(time.time() + ROLLBACK_WINDOW)}')
+    except subprocess.CalledProcessError as error:
+        if 'not found' not in (error.stderr or '').lower():
+            raise
+
+
+def reap_bases(vms):
+    failed, pending = 0, rollback_pending()
+    for vm in vms:
+        name, config = vm['name'], vm.get('config') or {}
+        if name.startswith('cbx-') or name == 'base-smoke':
+            continue
+        expires = config.get(EXPIRES, '')
+        if name == 'base-dev' and (config.get(MANAGED), expires) != ('true', 'never'):
+            ic('config', 'set', name, f'{MANAGED}=true', f'{EXPIRES}=never')
+        elif name == 'base-prev' and config.get(MANAGED) == 'true' and not expires.isdigit():
+            retire = int(time.time() + ROLLBACK_WINDOW)
+            ic('config', 'set', name, f'{MANAGED}=true', f'{EXPIRES}={retire}')
+            print(f'coldbox reap: base-prev kept for rollback until {retire}')
+        elif not pending and name not in ('base-dev', 'base-rollback') and config.get(MANAGED) == 'true' \
+                and expires.isdigit() and int(expires) < time.time():
+            gone = destroy(name)
+            failed += not gone
+            print(f"coldbox reap: {name} expired; {'deleted' if gone else 'FAILED to delete'}")
+    return failed
+
+
 def fetch_json(url):
-    request = urllib.request.Request(url, headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'coldbox'})
+    headers = {'Accept': 'application/vnd.github+json', 'User-Agent': 'coldbox'}
+    if urllib.parse.urlparse(url).netloc == 'api.github.com' and (token := app_token()):
+        headers['Authorization'] = f'Bearer {token}'
+    request = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(request, timeout=30) as response:
         return json.load(response)
 
@@ -1163,34 +2617,219 @@ rm -f /var/lib/dbus/machine-id
 
 
 def swap_base():
-    destroy('base-old')
+    if not destroy('base-prev'):
+        raise SystemExit('coldbox build-base: could not remove base-prev')
     try:
-        ic('move', 'base-dev', 'base-old')
+        ic('move', 'base-dev', 'base-prev')
     except subprocess.CalledProcessError:
         ic('move', 'base-new', 'base-dev')
         return
     try:
         ic('move', 'base-new', 'base-dev')
     except subprocess.CalledProcessError:
-        ic('move', 'base-old', 'base-dev')
+        ic('move', 'base-prev', 'base-dev')
         raise
-    destroy('base-old')
 
 
-def build_base(_args):
+def rollback_base():
+    journal = STATE / 'base-rollback.json'
+
+    def exists(name):
+        try:
+            ic('info', name)
+        except subprocess.CalledProcessError as error:
+            message = error.stderr.decode(errors='replace') if isinstance(error.stderr, bytes) else error.stderr or ''
+            wrapped = rf'Error: Failed to fetch instance "{re.escape(name)}" in project "[^"]+": Instance not found'
+            if re.fullmatch(r'(?:Error:\s*)?(?:The instance was|Instance) not found[.!]?', message.strip()) \
+                    or re.fullmatch(wrapped, message.strip()):
+                return False
+            raise RuntimeError(f'coldbox build-base: cannot inspect {name}') from error
+        return True
+
+    if journal.exists():
+        transaction = json.loads(journal.read_text())
+    else:
+        interrupted = exists('base-rollback')
+        if not interrupted and not exists('base-prev'):
+            raise SystemExit('coldbox build-base: no base-prev available for rollback')
+        paths = [STATE / 'base-packages.txt', STATE / 'base-packages.prev.txt']
+        transaction = dict(mode='swap', step=(2 if exists('base-dev') else 1) if interrupted else 0,
+                           manifests=[path.read_bytes().hex() if path.exists() else None for path in paths])
+        write_json(journal, transaction)
+    phases = {'swap': range(4), 'restore': range(3), 'complete': (3,)}
+    if transaction['mode'] not in phases or type(transaction['step']) is not int \
+            or transaction['step'] not in phases[transaction['mode']] or len(transaction['manifests']) != 2:
+        raise ValueError('invalid base rollback transaction')
+    manifests = [bytes.fromhex(value) if value is not None else None for value in transaction['manifests']]
+    if transaction['mode'] == 'complete':
+        return
+
+    def advance(step):
+        transaction['step'] = step
+        write_json(journal, transaction)
+
+    def restore():
+        if transaction['step'] == 2:
+            if not exists('base-prev'):
+                ic('move', 'base-dev', 'base-prev')
+            advance(1)
+        if transaction['step'] == 1:
+            if exists('base-rollback'):
+                ic('move', 'base-rollback', 'base-dev')
+            advance(0)
+        write_package_manifests(manifests)
+        journal.unlink()
+
+    if transaction['mode'] == 'restore':
+        restore()
+        return rollback_base()
+    if transaction['step'] == 0:
+        if not exists('base-rollback'):
+            ic('move', 'base-dev', 'base-rollback')
+        advance(1)
+    try:
+        if transaction['step'] == 1:
+            if not exists('base-dev'):
+                ic('move', 'base-prev', 'base-dev')
+            advance(2)
+        if transaction['step'] == 2:
+            if exists('base-rollback'):
+                ic('move', 'base-rollback', 'base-prev')
+            advance(3)
+    except subprocess.CalledProcessError:
+        transaction['mode'] = 'restore'
+        write_json(journal, transaction)
+        restore()
+        raise
+    write_package_manifests(reversed(manifests))
+    transaction['mode'] = 'complete'
+    write_json(journal, transaction)
+
+
+def write_package_manifests(contents):
+    paths = [STATE / 'base-packages.txt', STATE / 'base-packages.prev.txt']
+    for path, data in zip(paths, contents):
+        if data is None:
+            path.unlink(missing_ok=True)
+        else:
+            staged = path.with_suffix(path.suffix + '.tmp')
+            staged.write_bytes(data)
+            staged.replace(path)
+
+
+def print_base_changes(old_runner, new_runner):
+    def packages(path):
+        return dict(line.split(maxsplit=1) for line in path.read_text().splitlines())
+    current = packages(STATE / 'base-packages.txt')
+    previous = STATE / 'base-packages.prev.txt'
+    if not previous.exists():
+        print(f'Packages: {len(current)}')
+        return
+    old = packages(previous)
+    changed = [name for name in sorted(old.keys() | current.keys()) if old.get(name) != current.get(name)]
+    for name in changed:
+        print(f'{name}: {old.get(name, "(none)")} -> {current.get(name, "(none)")}')
+    if not changed:
+        print('Packages: no changes')
+    print(f'actions-runner: {old_runner} -> {new_runner}')
+
+
+def smoke_base():
+    name = 'base-smoke'
+    destroy(name)
+    try:
+        boot(name, int(time.time() + 900), False, base='base-new/warm')
+        result = subprocess.run(ic_exec(name, 'true', cwd=f'/home/{RUNNER}', timeout=60), capture_output=True, text=True)
+        if result.returncode:
+            raise RuntimeError(f'`true` exited {result.returncode} in a VM cloned from base-new/warm: '
+                               f'{result.stderr.strip()[-300:]}')
+    finally:
+        if not destroy(name):
+            raise RuntimeError(f'could not delete the smoke VM {name}; incus delete --force {name}')
+
+
+def build_base(args):
     if os.geteuid() != 0:
         raise SystemExit('coldbox build-base: run with sudo')
     with open(STATE / 'build-base.lock', 'w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        version = build_new_base()
-        swap_base()
-    print(f'coldbox build-base: PASS base-dev/warm built with actions-runner {version}')
+        if not getattr(args, 'rollback', False) and (STATE / 'base-rollback.json').exists():
+            rollback_base()
+            (STATE / 'base-rollback.json').unlink()
+        if getattr(args, 'rollback', False):
+            rollback_base()
+            print('coldbox build-base: PASS restored previous base as base-dev/warm')
+            return 0
+        try:
+            old_runner = ic('config', 'get', 'base-dev', 'user.coldbox.runner') or '(none)'
+        except subprocess.CalledProcessError:
+            old_runner = '(none)'
+        manifests = [STATE / 'base-packages.txt', STATE / 'base-packages.prev.txt']
+        saved = [path.read_bytes() if path.exists() else None for path in manifests]
+        try:
+            version = build_new_base()
+            try:
+                smoke_base()
+            except Exception as error:
+                destroy('base-new')
+                reason = ' '.join(f"{error} {getattr(error, 'stderr', None) or ''}".split())
+                write_json(STATE / 'base-smoke-failed.json', dict(at=now_iso(), runner=version, reason=reason))
+                raise SystemExit(f'coldbox build-base: FAIL the new base did not run a job, kept the current base: '
+                                 f'{reason}') from error
+            retire_live_base()
+            swap_base()
+        except BaseException:
+            for path, data in zip(manifests, saved):
+                if data is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    path.write_bytes(data)
+            raise
+        (STATE / 'base-smoke-failed.json').unlink(missing_ok=True)
+        print_base_changes(old_runner.strip(), version)
+        print(f'coldbox build-base: PASS base-dev/warm built with actions-runner {version}')
     return 0
+
+
+GUEST_OVERLAY_DIRS = r'''set -eu
+owned=$1/$2
+mkdir -p "${owned%/*}"
+touch "$owned"
+while IFS= read -r line; do
+  mode=${line%% *} dir=${line#* }
+  path=$1/$dir
+  if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+    printf '%s\n' "$dir" >>"$owned"
+  elif [ -d "$path" ] && [ ! -L "$path" ] && grep -qxF -- "$dir" "$owned"; then
+    chmod "$mode" "$path"
+  fi
+done
+'''
+
+
+OVERLAY_DIRS_RECORD = 'var/lib/coldbox/overlay-dirs'
+
+
+def guest_overlay_dirs():
+    if os.path.lexists(GUEST_FILES / OVERLAY_DIRS_RECORD):
+        raise ValueError(f'guest files may not contain {OVERLAY_DIRS_RECORD}; Coldbox keeps its own record there')
+    found = []
+    for top, names, _ in os.walk(GUEST_FILES):
+        for directory in names:
+            path = Path(top, directory)
+            relative = str(path.relative_to(GUEST_FILES))
+            if '\n' in relative:
+                raise ValueError(f'guest file directory name contains a newline: {relative!r}')
+            if not path.is_symlink():
+                found.append(f'0{path.lstat().st_mode & 0o7777:04o} '.encode() + os.fsencode(relative) + b'\n')
+    return b''.join(found)
 
 
 def push_guest_files(name):
     if not GUEST_FILES.is_dir():
         return
+    subprocess.run(ic_exec(name, 'sh', '-c', GUEST_OVERLAY_DIRS, 'sh', '/', OVERLAY_DIRS_RECORD, user=None), input=guest_overlay_dirs(),
+                   check=True)
     pack = subprocess.Popen(['tar', '-C', str(GUEST_FILES), '--owner=0', '--group=0', '--numeric-owner', '-c', '.'],
                             stdout=subprocess.PIPE)
     try:
@@ -1201,6 +2840,9 @@ def push_guest_files(name):
         packed = pack.wait()
     if packed:
         raise subprocess.CalledProcessError(packed, pack.args)
+    tool, link = 'opt/coldverify/coldverify', 'usr/local/bin/coldverify'
+    if os.path.lexists(GUEST_FILES / tool) and not os.path.lexists(GUEST_FILES / link):
+        subprocess.run(ic_exec(name, 'ln', '-sf', f'/{tool}', f'/{link}', user=None), check=True)
 
 
 def seed_cloud_init_on_create_only(name):
@@ -1218,11 +2860,17 @@ def build_new_base():
     new = 'base-new'
     destroy(new)
     try:
-        ic('launch', IMAGE, new, '--vm', '--profile', 'coldbox')
+        ic('launch', IMAGE, new, '--vm', '--profile', 'coldbox', *lifecycle('never'))
         wait_ready(new, time.time() + 900, network=True)
         subprocess.run(ic_exec(new, 'env', f'RUNNER_URL={url}', f'RUNNER_SHA256={digest}', 'bash', '-s', user=None),
                        input=GUEST_SETUP.encode(), check=True)
         push_guest_files(new)
+        packages = subprocess.run(ic_exec(new, 'dpkg-query', '-W', '-f', '${Package} ${Version}\\n', user=None),
+                                  check=True, capture_output=True, text=True).stdout
+        manifest = STATE / 'base-packages.txt'
+        if manifest.exists():
+            manifest.replace(STATE / 'base-packages.prev.txt')
+        manifest.write_text(packages)
         ic('stop', new)
         seed_cloud_init_on_create_only(new)
         ic('config', 'set', new, f'user.coldbox.runner={version}')
@@ -1251,10 +2899,87 @@ def kvm_fix():
         virt = ''
     if virt in ('', 'none'):
         return 'enable VT-x/AMD-V in the BIOS'
+    if virt == 'wsl':
+        return 'WSL2 gives Coldbox no KVM, so run it on a Linux machine, see README.md#wsl2'
     return f'this host is a {virt} VM or container, so Coldbox needs nested virtualization from its provider, see docs/vps.md'
 
 
+def build_id():
+    return hashlib.sha256(Path(__file__).resolve().read_bytes()).hexdigest()[:12]
+
+
+def check_visibility(registration, check):
+    target = registration['target']
+    registration['visibility'] = 'unknown'
+    try:
+        repo = gh(scope(target))
+        registration['visibility'] = repo['visibility']
+        if repo['visibility'] == 'private':
+            return
+        if not registration.get('allow_public'):
+            hosted = f"move {target}'s workflows to GitHub-hosted runners"
+            check(False, f"{target} is {repo['visibility']} and registered without --allow-public, so no jobs run",
+                  f"{hosted}, or, with the owner's approval, set its fork-pr-contributor-approval to {APPROVAL} "
+                  f"and run coldbox register {target} --slots {registration['slots']} --allow-public"
+                  if (repo.get('owner') or {}).get('type') == 'User' else
+                  f'{hosted}; --allow-public serves only repos owned by a user account')
+        else:
+            writers = public_writers(gh, target, repo)
+            check(True, f"{target} is {repo['visibility']} with --allow-public: jobs from "
+                  f"{', '.join(writers) or 'nobody'} (write access) run without approval", '')
+    except Unsafe as error:
+        check(False, f'{target}: {error}', 'fix that, or move its workflows to GitHub-hosted runners')
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
+        check(False, f'{target}: visibility unreadable from GitHub: {error}', 'fix GitHub auth, then rerun')
+
+
+GUEST_DIGEST = '''set -euo pipefail
+export LC_ALL=C
+cd "$1"
+entries=$(find . -mindepth 1 -maxdepth 1 -printf '%P\\n' | sort)
+while IFS= read -r e; do
+    [ -n "$e" ] || continue
+    d=$({ find "$e" -printf '%y %m %p %l\\n' | sort; find "$e" -type f -print0 | sort -z | xargs -0r sha256sum; } |
+        sha256sum | cut -c1-16)
+    printf '%s %s\\n' "$d" "$e"
+done <<< "$entries"'''
+
+
+def guest_digests(host):
+    command = ['bash', '-c', GUEST_DIGEST, 'bash', str(GUEST_FILES / 'opt')]
+    result = subprocess.run(command if host == os.uname().nodename else ssh(host, command),
+                            capture_output=True, text=True, timeout=60, check=True)
+    return {name: digest for digest, name in (line.split(' ', 1) for line in result.stdout.splitlines())}
+
+
+def check_guest_drift(check):
+    try:
+        host, policy = admitted_fleet()
+    except RuntimeError as error:
+        check(False, f'guest overlay drift unchecked: {error}', f'fix {CI_HOSTS}')
+        return
+    peers = [peer for peer in [policy[0], *policy[1]] if peer != host] if policy else []
+    if not peers:
+        return
+    drift = []
+    try:
+        mine = guest_digests(host)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        mine, drift = {}, [f'{host}: unreadable ({error})']
+    for peer in peers:
+        try:
+            theirs = guest_digests(peer)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            drift.append(f'{peer}: unreadable')
+            continue
+        drift += [f'{peer}: opt/{name}' for name in sorted(mine.keys() | theirs.keys()) if mine.get(name) != theirs.get(name)]
+    check(not drift, f"guest overlay {GUEST_FILES / 'opt'} matches {' '.join(peers)}"
+          f"{': differs on ' if drift else ''}{', '.join(drift)}",
+          'run sudo systemctl start coldbox-refresh.service on every CI host so all copy the same commits')
+
+
 def status(_args):
+    print(f'coldbox {VERSION} (build {build_id()})')
     failures = []
 
     def check(ok, text, fix):
@@ -1265,14 +2990,25 @@ def status(_args):
 
     check(Path('/dev/kvm').exists(), 'hardware virtualization (/dev/kvm)', kvm_fix())
     try:
-        gh_ok, gh_fix = subprocess.run(['gh', 'auth', 'status'], capture_output=True).returncode == 0, 'gh auth login'
+        if app_token():
+            check(True, 'GitHub auth: GitHub App installation token', '')
+        elif subprocess.run(['gh', 'auth', 'status'], capture_output=True).returncode == 0:
+            print('WARN  GitHub auth: personal gh login, which can do anything its account can')
+            print('      fix: coldbox setup-app (a GitHub App with only runner administration)')
+        else:
+            check(False, 'GitHub auth: no GitHub App and no gh login', 'coldbox setup-app')
     except OSError:
-        gh_ok, gh_fix = False, 'sudo ./install.sh installs gh; then gh auth login'
-    check(gh_ok, 'gh is logged in', gh_fix)
+        check(False, 'GitHub auth: no GitHub App and gh is not installed', 'coldbox setup-app')
+    except RuntimeError as error:
+        check(False, f'GitHub auth: GitHub App configured but failing: {error}', f'check {APP_ENV} and {APP_KEY}')
     for timer in ('coldbox-reap.timer', 'coldbox-refresh.timer'):
         active = subprocess.run(['systemctl', 'is-active', '--quiet', timer]).returncode == 0
         check(active, f'{timer} is active', 'sudo ./install.sh')
+    check_guest_drift(check)
     registered = registrations()
+    for r in registered:
+        if '/' in r['target']:
+            check_visibility(r, check)
     try:
         version = query('/1.0')['environment']['server_version']
         check(not incus_crashes(version), f'Incus {version} has the fix for crash lxc/incus#2865 (6.0.6+)',
@@ -1287,26 +3023,71 @@ def status(_args):
               f"storage pool {POOL}: {space['used'] / 2**30:.0f} of {space['total'] / 2**30:.0f} GiB used",
               'run coldbox reap, or reinstall with a larger COLDBOX_POOL_SIZE')
         memory, host = vm_memory(), host_memory()
-        slots = sum(r['slots'] for r in registered if r['active'] == 'active')
-        check(fits(slots, memory, host), f"job VMs: {ic('profile', 'get', 'coldbox', 'limits.cpu').strip()} vCPU, "
-              f'{memory / 2**30:g} GiB each; {slots} slot(s) registered, {host / 2**30:.0f} GiB RAM',
-              'unregister a repo or register again with fewer --slots')
-        vms = [vm for vm in json.loads(ic('list', '--format', 'json')) if vm['name'].startswith('cbx-')]
+        slots = sum(r['slots'] for r in registered if holds_slots(r))
+        limit = slot_limit(memory, host, host_setting(RESERVE, 'CPU threads'))
+        check(slots <= limit, f"job VMs: {ic('profile', 'get', 'coldbox', 'limits.cpu').strip()} vCPU, "
+              f'{memory / 2**30:g} GiB each; {slots} slot(s) registered, at most {limit} leave room for one more VM '
+              f'within {vm_bound(host_setting(RESERVE, "CPU threads"))} job VMs (CPU threads less the reserve, '
+              f'{CORES_PER_JOB} per VM) and for one large VM in {host / 2**30:.0f} GiB RAM', 'unregister a repo or register again with fewer --slots')
+        listed = json.loads(ic('list', '--format', 'json'))
+        vms = [vm for vm in listed if vm['name'].startswith('cbx-')]
     except (OSError, ValueError, subprocess.CalledProcessError):
         check(False, 'Coldbox is installed (base-dev/warm, storage pool, profile)', 'sudo ./install.sh')
-        vms = []
-    try:
-        standby = standby_seconds()
-    except ValueError as error:
-        standby = 0
-        check(False, str(error), f'write a number of seconds to {STANDBY}, or delete it')
+        listed = vms = []
+    settings = {}
+    for path, unit in ((RESERVE, 'CPU threads'), (VM_MAX, 'VMs')):
+        try:
+            settings[path] = host_setting(path, unit)
+        except ValueError as error:
+            settings[path] = 0
+            check(False, str(error), f'write a number of {unit} to {path}, or delete it')
+    live = {worker.name for worker in live_workers(STATE / 'workers', prune=False)}
+    orphans = [vm['name'] for vm in vms if orphan(vm, live)]
+    check(not orphans, f"{len(orphans)} job VM(s) without a live worker{': ' if orphans else ''}{' '.join(orphans)}",
+          'coldbox reap')
+    unmanaged = [vm['name'] for vm in listed if not managed(vm)]
+    check(not unmanaged, f"{len(unmanaged)} Incus instance(s) in project {PROJECT} without {MANAGED}=true and "
+          f"{EXPIRES}{': ' if unmanaged else ''}{' '.join(unmanaged)}",
+          f'incus --project {PROJECT} delete NAME, or if Coldbox made it: incus --project {PROJECT} config set NAME '
+          f'{MANAGED}=true {EXPIRES}=<unix time>')
+    stale = [path.stem for path, _ in unreconciled(live)]
+    check(not stale, f"{len(stale)} receipt(s) with vm.destroyed false and no live worker"
+          f"{': ' if stale else ''}{' '.join(stale[:10])}{' ...' if len(stale) > 10 else ''}", 'coldbox reap')
+    now = time.time()
+    held = [path.stem for path, receipt in unreconciled(set()) if receipt['id'] in live and past_ttl(receipt, now)]
+    check(not held, f"{len(held)} receipt(s) past their VM TTL with vm.destroyed false"
+          f"{': ' if held else ''}{' '.join(held[:10])}{' ...' if len(held) > 10 else ''}",
+          f"coldbox reap; if it stays, stop the worker still holding it ({STATE / 'workers'}/<pid>)")
+    smoke = STATE / 'base-smoke-failed.json'
+    if smoke.exists():
+        try:
+            failed = json.loads(smoke.read_text())
+            text = f"base build at {failed['at']} (actions-runner {failed['runner']}) failed its smoke job, " \
+                   f"so it was not swapped in: {failed['reason']}"
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            text = f'a base build failed its smoke job; {smoke} is unreadable: {error}'
+        check(False, text, 'fix the cause, then sudo coldbox build-base')
     print('\nRunners')
-    if standby:
-        print(f'  standby host: bursts start only for jobs queued over {standby} s ({STANDBY})')
+    if settings[RESERVE]:
+        print(f'  reserve: bursts leave {settings[RESERVE]} CPU thread(s) to other work ({RESERVE})')
+    if VM_MAX.exists():
+        print(f'  vm-max: at most {settings[VM_MAX]} ad-hoc VM(s) from coldbox vm up ({VM_MAX})')
+    cap_path = STATE / 'ramp-cap.json'
+    if cap_path.exists():
+        print(f'  capacity cap ({cap_path}): {cap_path.read_text().strip()}')
     for r in registered:
-        print(f"  {r['target']:32} {r['active']:10} {slots_text(r['slots'])}")
+        print(f"  {r['target']:32} {r['active']:10} {slots_text(r['slots'])}; {r.get('visibility', 'organization')}")
     if not registered:
         print('  none: coldbox register OWNER/REPO')
+    for path in sorted((STATE / 'queues').glob('*/*.json')):
+        try:
+            queue = json.loads(path.read_text())
+        except (OSError, ValueError) as error:
+            print(f'  queue {path.parent.name}/{path.stem}: observation unavailable: {error}')
+            continue
+        print(f"  queue {path.parent.name}/{path.stem}: {queue['queued']} queued; "
+              f"oldest waited {queue['oldest_wait_seconds']} s; "
+              f"{'STALLED' if queue['stalled'] else 'clear'}; observed {queue['observed_at']}")
     print('\nJob VMs')
     for vm in vms:
         left = int((vm.get('config') or {}).get('user.coldbox.expires', 0)) - time.time()
@@ -1317,13 +3098,277 @@ def status(_args):
     receipts = sorted((STATE / 'receipts').glob('cbx-*.json'), key=lambda path: path.stat().st_mtime)[-5:]
     for path in reversed(receipts):
         r = json.loads(path.read_text())
-        print(f"  {r['id']:24} {r['verdict']:10} {r['repo'] or '':32} {r.get('seconds', 0):6.0f}s  {r['started_at']}")
+        wait = (r.get('github') or {}).get('queue_wait_seconds')
+        queue_text = f'; queue waited {wait:g} s' if wait is not None else ''
+        print(f"  {r['id']:24} {r['verdict']:10} {r['repo'] or '':32} {r.get('seconds', 0):6.0f}s  {r['started_at']}{queue_text}")
     if not receipts:
         print('  none')
     return 1 if failures else 0
 
 
+def vcpus(text):
+    if not re.fullmatch(r'[1-9]\d*', text) or int(text) > os.cpu_count():
+        raise argparse.ArgumentTypeError(f'use a vCPU count from 1 to {os.cpu_count()}, not {text!r}')
+    return int(text)
+
+
+def vm_size(text):
+    if not re.fullmatch(r'[1-9]\d{0,6}(MiB|GiB)', text):
+        raise argparse.ArgumentTypeError(f'use a size such as 8GiB or 512MiB, not {text!r}')
+    return text
+
+
+def window(text):
+    match = re.fullmatch(r'([1-9]\d*)([smhd])', text)
+    if not match:
+        raise argparse.ArgumentTypeError(f'use a duration such as 30m, 1h or 7d, not {text!r}')
+    return int(match[1]) * dict(s=1, m=60, h=3600, d=86400)[match[2]]
+
+
+def at(text):
+    return datetime.fromisoformat(text).timestamp()
+
+
+def spread(values):
+    values = sorted(values)
+    rank = lambda share: values[max(0, math.ceil(share * len(values)) - 1)]
+    return dict(n=len(values), p50=rank(.5), p90=rank(.9), max=values[-1]) if values else dict(n=0)
+
+
+def ran_job(receipt):
+    if receipt.get('mode') == 'runner':
+        return bool(receipt.get('github')) and not receipt['github'].get('refused')
+    return 'exit' in receipt
+
+
+def job_span(receipt, now=None):
+    github = receipt.get('github') or {}
+    try:
+        if now is not None and running(receipt):
+            if receipt['mode'] == 'runner':
+                found = re.findall(rb'^(\d{4}-\d\d-\d\d) (\d\d:\d\d:\d\d)Z: Running job', Path(receipt['log']).read_bytes(),
+                                   re.M)
+                return (at(f'{found[-1][0].decode()}T{found[-1][1].decode()}+00:00'), now) if found else None
+            return at(receipt['job_started_at']), now
+        if receipt['mode'] == 'runner':
+            return at(github['runner_started_at']), at(github.get('completed_at') or receipt['job_ended_at'])
+        return at(receipt['job_started_at']), at(receipt['job_ended_at'])
+    except (KeyError, TypeError, ValueError, OSError):
+        return None
+
+
+def job_wall(receipt):
+    span = job_span(receipt)
+    if span:
+        return round(span[1] - span[0], 3)
+    return receipt.get('job_seconds') if receipt.get('mode') != 'runner' else None
+
+
+STAT_METRICS = dict(queue_wait=lambda r: (r.get('github') or {}).get('queue_wait_seconds'),
+                    boot_to_ready=lambda r: (r.get('vm') or {}).get('ready_seconds'),
+                    job_wall=job_wall)
+
+
+def job_stats(jobs):
+    found = dict(jobs=len(jobs))
+    for metric, read in STAT_METRICS.items():
+        values = [value for value in map(read, jobs) if type(value) in (int, float)]
+        found[metric] = dict(spread(values), missing=len(jobs) - len(values))
+    return found
+
+
+def step_times(receipt):
+    steps = (receipt.get('github') or {}).get('steps') or []
+    return ([(step.get('name'), step.get('seconds')) for step in steps] +
+            [(f"checks/{check.get('check')}", check.get('seconds')) for check in receipt.get('checks') or []])
+
+
+def most_at_once(spans):
+    edges = sorted([(start, 1) for start, _ in spans] + [(end, -1) for _, end in spans])
+    now = best = 0
+    for _, change in edges:
+        now += change
+        best = max(best, now)
+    return best
+
+
+def running(receipt):
+    return 'seconds' not in receipt and not (receipt.get('vm') or {}).get('destroyed')
+
+
+def vm_span(receipt, now):
+    start, vm = at(receipt['started_at']), receipt.get('vm') or {}
+    if not vm.get('destroyed'):
+        return start, now
+    return start, at(vm['destroyed_at']) if vm.get('destroyed_at') else start + receipt['seconds']
+
+
+def job_start(receipt, now):
+    """When the job started, or None for a VM that never got one."""
+    try:
+        if receipt['mode'] == 'runner' and (receipt.get('github') or {}).get('runner_started_at'):
+            return at(receipt['github']['runner_started_at'])
+    except ValueError:
+        return None
+    span = job_span(receipt, now)
+    if span:
+        return span[0]
+    return at(receipt['started_at']) if ran_job(receipt) else None
+
+
+def busy_span(receipt, now):
+    """A job's busy time. A runner receipt from before job end times were recorded ends when its VM did."""
+    span = job_span(receipt, now)
+    if span or not ran_job(receipt) or (start := job_start(receipt, now)) is None:
+        return span
+    return start, vm_span(receipt, now)[1]
+
+
+def saturation(receipts, cutoff, now):
+    def in_window(spans):
+        return [(max(start, cutoff), end) for start, end in spans if end >= cutoff]
+
+    ceilings = [r['vm']['host_ceiling'] for r in receipts if type((r.get('vm') or {}).get('host_ceiling')) is int]
+    busy = filter(None, (busy_span(r, now) for r in receipts))
+    return dict(vms_peak=most_at_once(in_window(vm_span(r, now) for r in receipts)),
+                busy_peak=most_at_once(in_window(busy)), ceiling=max(ceilings, default=None),
+                overflow_jobs=sum(1 for r in receipts if (job_start(r, now) or 0) >= cutoff
+                                  and r.get('admission') and r['admission'].get('host') != r['admission'].get('primary')))
+
+
+def orchestration_split(jobs):
+    pairs = [(vm['ready_seconds'] + vm['destroy_seconds'], wall) for vm, wall in
+             ((r.get('vm') or {}, job_wall(r)) for r in jobs)
+             if all(type(value) in (int, float) for value in (vm.get('ready_seconds'), vm.get('destroy_seconds'), wall))]
+    orchestration, test = sum(pair[0] for pair in pairs), sum(pair[1] for pair in pairs)
+    return dict(jobs=len(pairs), missing=len(jobs) - len(pairs), orchestration_seconds=round(orchestration, 3),
+                test_seconds=round(test, 3),
+                orchestration_pct=round(100 * orchestration / (orchestration + test), 1) if orchestration + test else None)
+
+
+def outcomes(settled):
+    verdicts = collections.Counter(r.get('verdict') or 'unknown' for r in settled)
+    definitive = verdicts['pass'] + verdicts['fail']
+    return dict(settled=len(settled), definitive=definitive,
+                definitive_pct=round(100 * definitive / len(settled), 1) if settled else None,
+                verdicts=dict(sorted(verdicts.items())),
+                incomplete_causes=dict(collections.Counter(r.get('cause') or 'unknown' for r in settled
+                                                           if r.get('verdict') == 'incomplete').most_common()))
+
+
+def read_receipts(folders, cutoff, now):
+    found, unreadable = [], 0
+    for folder in folders:
+        for path in sorted(Path(folder).glob('cbx-*.json')):
+            try:
+                receipt = json.loads(path.read_text())
+                if vm_span(receipt, now)[1] >= cutoff:
+                    found.append(receipt)
+            except (OSError, ValueError, KeyError, TypeError):
+                unreadable += 1
+    return found, unreadable
+
+
+def stats_report(receipts, since, now):
+    """Times cover jobs that started in the window, even on an older warm VM; saturation covers every VM alive in it."""
+    cutoff = now - since
+    active = receipts
+    receipts = [r for r in receipts if at(r['started_at']) >= cutoff]
+    jobs = [r for r in active if ran_job(r) and (job_start(r, now) or 0) >= cutoff]
+    job_ids = set(map(id, jobs))
+    group = collections.defaultdict(list)
+    for r in jobs:
+        group['repo', (r.get('github') or {}).get('repo') or r.get('repo') or 'unknown'].append(r)
+    hosts = collections.defaultdict(list)
+    for r in active:
+        hosts[r.get('host') or 'unknown'].append(r)
+    steps = collections.defaultdict(list)
+    missing_steps = 0
+    for r in jobs:
+        times = step_times(r)
+        missing_steps += not times
+        for name, seconds in times:
+            if type(seconds) in (int, float):
+                steps[(r.get('github') or {}).get('repo') or r.get('repo') or 'unknown', name].append(seconds)
+    settled_at = lambda r: at(r['started_at']) + r['seconds'] if 'seconds' in r else vm_span(r, now)[1]
+    settled = [r for r in active if not running(r) and r.get('verdict') not in ('idle', 'refused')
+               and settled_at(r) >= cutoff]
+    job_end = lambda r: (job_span(r) or (0, at(r['job_ended_at']) if r.get('job_ended_at') else 0))[1]
+    finished = sum(1 for r in active if ran_job(r) and not running(r) and job_end(r) >= cutoff)
+    orphans = sum((r.get('vm') or {}).get('destroyed') is False and ('seconds' in r or past_ttl(r, now)) for r in active)
+    slowest = sorted((dict(repo=repo, step=name, **spread(values)) for (repo, name), values in steps.items()),
+                     key=lambda step: step['p90'], reverse=True)[:10]
+    return dict(since_seconds=since, since=datetime.fromtimestamp(now - since, timezone.utc).isoformat(timespec='seconds'),
+                vms=len(receipts), **job_stats(jobs), jobs_per_hour=round(finished * 3600 / since, 2),
+                outcomes=outcomes(settled), split=orchestration_split(jobs), orphans=orphans,
+                jobs_without_steps=missing_steps,
+                repos={name: job_stats(rows) for (_, name), rows in sorted(group.items())},
+                hosts={name: dict(job_stats([r for r in rows if id(r) in job_ids]),
+                                  vms=sum(at(r['started_at']) >= cutoff for r in rows), **saturation(rows, cutoff, now))
+                       for name, rows in sorted(hosts.items())},
+                slowest_steps=slowest)
+
+
+def stats_text(report):
+    def cell(metric):
+        if not metric['n']:
+            return '-'
+        return '/'.join(f'{metric[key]:.0f}' for key in ('p50', 'p90', 'max'))
+
+    def missing(row):
+        gaps = [f'{metric} {row[metric]["missing"]}' for metric in STAT_METRICS if row[metric]['missing']]
+        return ', '.join(gaps) or '-'
+
+    def table(rows):
+        widths = [max(len(str(row[i])) for row in rows) for i in range(len(rows[0]))]
+        return [' '.join(str(value).ljust(width) for value, width in zip(row, widths)).rstrip() for row in rows]
+
+    def pct(value):
+        return '-' if value is None else f'{value:g}%'
+
+    def p50_p90(metric):
+        return f"{metric['p50']:.0f}/{metric['p90']:.0f} s" if metric['n'] else '-'
+
+    found, split = report['outcomes'], report['split']
+    causes = ', '.join(f'{name} {count}' for name, count in found['incomplete_causes'].items()) or '-'
+    lines = [f"coldbox stats: {report['jobs']} finished jobs on {report['vms']} VMs since {report['since']}",
+             f"definitive (pass or fail): {found['definitive']} of {found['settled']} settled, {pct(found['definitive_pct'])}",
+             f'incomplete causes: {causes}',
+             f"ready p50/p90: {p50_p90(report['boot_to_ready'])}; queue p50/p90: {p50_p90(report['queue_wait'])}; "
+             f"jobs/hour: {report['jobs_per_hour']:g}",
+             f"orchestration (VM ready + destroy) vs test (job wall): {split['orchestration_seconds']:.0f} s vs "
+             f"{split['test_seconds']:.0f} s, {pct(split['orchestration_pct'])} orchestration over {split['jobs']} jobs",
+             f"orphans (vm.destroyed false after the job or its TTL): {report['orphans']}", '',
+             'seconds as p50/p90/max; MISSING counts jobs whose receipt lacks the field', '']
+    head = ['JOBS', 'QUEUE WAIT', 'BOOT TO READY', 'JOB WALL', 'MISSING']
+    for title, key in (('REPO', 'repos'), ('HOST', 'hosts')):
+        rows = [[title] + head] + [[name, row['jobs'], *(cell(row[m]) for m in STAT_METRICS), missing(row)]
+                                   for name, row in report[key].items()]
+        lines += table(rows) + ['']
+    lines += table([['HOST', 'VMS PEAK', 'BUSY PEAK', 'CEILING', 'OVERFLOW JOBS']] +
+                   [[name, row['vms_peak'], row['busy_peak'], row['ceiling'] or '-', row['overflow_jobs']]
+                    for name, row in report['hosts'].items()]) + ['']
+    lines += table([['SLOWEST STEPS', 'REPO', 'N', 'P50/P90/MAX']] +
+                   [[step['step'], step['repo'], step['n'], cell(step)] for step in report['slowest_steps']])
+    if report['jobs_without_steps']:
+        lines.append(f"{report['jobs_without_steps']} job(s) recorded no step timing")
+    return '\n'.join(lines)
+
+
+def stats(args):
+    now = time.time()
+    receipts, unreadable = read_receipts(args.receipts or [STATE / 'receipts'], now - args.since, now)
+    report = stats_report(receipts, args.since, now)
+    report['unreadable_receipts'] = unreadable
+    print(json.dumps(report, indent=2) if args.json else stats_text(report))
+    if unreadable and not args.json:
+        print(f'coldbox: skipped {unreadable} unreadable receipt(s)', file=sys.stderr)
+    return 0
+
+
 def detect_cmd(args):
+    if args.workflow:
+        return detect_workflow(args.path)
     found, host = detect(args.path), host_switches()
     if not found:
         print('coldbox: no checks detected; write [commands] in coldbox.toml yourself', file=sys.stderr)
@@ -1331,8 +3376,23 @@ def detect_cmd(args):
     print('# coldbox.toml: set a check to false to switch it off; replace a command under [commands].')
     print('[checks]')
     for name in [n for n in CHECK_ORDER if n in found] + [n for n in found if n not in CHECK_ORDER]:
-        source = f'{RECIPE}: ' if name == 'verify' else ''
-        print(f"{name} = {'true' if host.get(name, True) else 'false'}  # {source}" + ' ; '.join(found[name]))
+        print(f"{name} = {'true' if host.get(name, True) else 'false'}  # " + ' ; '.join(found[name]))
+    return 0
+
+
+def detect_workflow(root):
+    for path in sorted((Path(root) / '.github' / 'workflows').glob('*.y*ml')):
+        lines = path.read_text(errors='replace').splitlines()
+        if any(re.search(r'\bcoldbox\s+checks\b', line.split(' #')[0]) for line in lines
+               if not re.match(r'\s*(#|-?\s*name:)', line)):
+            print(f'coldbox: {path.relative_to(root)} already runs coldbox checks', file=sys.stderr)
+            return 1
+    steps = plan(root)
+    if not steps:
+        print('coldbox: no checks would run; write [commands] in coldbox.toml yourself', file=sys.stderr)
+        return 1
+    print(WORKFLOW + '# coldbox checks runs these here (coldbox.toml switches them):',
+          *[f'#   {name}: ' + ' ; '.join(commands).replace('\n', '\n#     ') for name, commands in steps], sep='\n')
     return 0
 
 
@@ -1354,24 +3414,34 @@ def main(argv=None):
     if argv[:1] == ['run'] and '--' in argv:
         words, command = argv[:argv.index('--')], argv[argv.index('--') + 1:]
     parser = argparse.ArgumentParser(prog='coldbox', description=__doc__)
-    parser.add_argument('--version', action='version', version=f'%(prog)s {VERSION}')
+    parser.add_argument('--version', action='version', version=f'%(prog)s {VERSION} (build {build_id()})')
     sub = parser.add_subparsers(dest='cmd', required=True)
     p = sub.add_parser('detect', help='print a suggested coldbox.toml for a repo')
     p.add_argument('path', nargs='?', default='.')
+    p.add_argument('--workflow', action='store_true',
+                   help='print a GitHub Actions workflow that runs the checks, unless one already does')
     p = sub.add_parser('checks', help='run the enabled checks here (used inside the VM)')
     p.add_argument('path', nargs='?', default='.')
-    p = sub.add_parser('run', help="run a local repo's checks, or -- COMMAND, in a throwaway VM and write a receipt",
-                       usage='coldbox run [-h] [--offline] [--ttl TTL] [--receipts DIR] [path | -- COMMAND [ARG ...]]')
-    p.add_argument('path', nargs='?', default='.')
+    p = sub.add_parser('run', help="run a local repo's or a GitHub commit's checks, or -- COMMAND, in a throwaway VM "
+                                   'and write a receipt',
+                       usage='coldbox run [-h] [--offline] [--ttl TTL] [--cpus N] [--memory SIZE] [--receipts DIR] '
+                             '[path | --repo OWNER/REPO --sha SHA | -- COMMAND [ARG ...]]')
+    p.add_argument('path', nargs='?')
+    p.add_argument('--repo', type=repo_name, help='clone this GitHub repo in the VM, with a read-only token for it alone')
+    p.add_argument('--sha', type=commit_sha, help='the full commit SHA to clone with --repo')
     p.add_argument('--offline', action='store_true', help='give the VM no network at all')
     p.add_argument('--ttl', type=int, default=3600, help='VM lifetime limit in seconds (default 3600)')
+    p.add_argument('--cpus', type=vcpus, help="this VM's vCPU count instead of the coldbox profile's")
+    p.add_argument('--memory', type=vm_size, help="this VM's memory, e.g. 8GiB, up to the coldbox profile's")
     p.add_argument('--receipts', metavar='DIR',
                    help=f"write the receipt to DIR instead of {STATE / 'receipts'}; for stress and test runs")
     for name, text in (('serve', 'run ephemeral runners for a repo or org in a loop'),
                        ('register', 'start a coldbox runner service for a repo or org')):
         p = sub.add_parser(name, help=text)
         p.add_argument('target', help='OWNER/REPO or ORG')
-        p.add_argument('--allow-public', action='store_true', default=os.environ.get('COLDBOX_ALLOW_PUBLIC') == '1')
+        p.add_argument('--allow-public', action='store_true',
+                       default=name == 'serve' and os.environ.get('COLDBOX_ALLOW_PUBLIC') == '1',
+                       help='serve a public repo you own: write users run at once, others after your approval')
         p.add_argument('--allow-forks', action='store_true', default=os.environ.get('COLDBOX_ALLOW_FORKS') == '1')
         p.add_argument('--slots', type=int, default=int(os.environ.get('COLDBOX_SLOTS', '1')),
                        help='job VMs that may run at once (default 1)')
@@ -1381,25 +3451,45 @@ def main(argv=None):
             p.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
             p.add_argument('--idle', type=int, default=0, help=argparse.SUPPRESS)
             p.add_argument('--name', help=argparse.SUPPRESS)
-    p = sub.add_parser('unregister', help='stop the runner service and delete coldbox runners on GitHub')
+            p.add_argument('--size', choices=SIZES, default='default', help=argparse.SUPPRESS)
+    p = sub.add_parser('unregister', help="stop the runner service and delete this host's coldbox runners on GitHub")
     p.add_argument('target')
-    p = sub.add_parser('reap', help='delete job VMs past their TTL and old receipts')
+    p = sub.add_parser('reap', help='delete job VMs past their TTL or without a live worker, finalize their receipts, and delete old receipts')
     p.add_argument('--keep-days', type=int, default=30, help='delete receipts older than this; 0 keeps all')
     vm = sub.add_parser('vm', help='a disposable VM to use by hand: up, exec, down, list').add_subparsers(
         dest='action', required=True)
     p = vm.add_parser('up', help='start a VM from base-dev/warm and print its name')
     p.add_argument('--ttl', type=int, default=7200, help='seconds before the reaper deletes it (default 7200)')
     p.add_argument('--offline', action='store_true', help='give the VM no network at all')
+    p.add_argument('--here', action='store_true', help='start it on this host only, never on another CI host')
     p = vm.add_parser('exec', help='run a command in the VM as runner; stdin and stdout pass through')
     p.add_argument('name')
     p.add_argument('command', nargs='+')
     vm.add_parser('down', help='delete the VM').add_argument('name')
     vm.add_parser('list', help='list ad-hoc VMs')
     sub.add_parser('status', help='health checks, runners, job VMs and recent receipts')
-    sub.add_parser('build-base', help='rebuild base-dev/warm with current packages and actions-runner (sudo)')
+    p = sub.add_parser('setup-app', help='set up least-privilege GitHub App auth: print the steps, then install its key (sudo)')
+    p.add_argument('--org', help='create the App under this organization (for org-wide runners)')
+    p.add_argument('--app-id', help='the numeric App ID shown after creating the App')
+    p.add_argument('--key', help='the private key .pem downloaded from the App settings')
+    p = sub.add_parser('stats', help='outcomes, queue wait, boot, job time, slowest steps and host load from recent receipts')
+    p.add_argument('--since', type=window, default=window('1h'), help='how far back to look, e.g. 30m, 1h, 7d (default 1h)')
+    p.add_argument('--receipts', metavar='DIR', action='append',
+                   help=f"read receipts from DIR instead of {STATE / 'receipts'}; repeat to combine hosts")
+    p.add_argument('--json', action='store_true', help='print the summary as JSON')
+    p = sub.add_parser('selftest', help='prove in a job VM that isolation and the profile limits hold; writes a receipt')
+    p.add_argument('suite', choices=['isolation'])
+    p.add_argument('--ttl', type=int, default=3600, help='VM lifetime limit in seconds (default 3600)')
+    p.add_argument('--receipts', metavar='DIR',
+                   help=f"write the receipt to DIR instead of {STATE / 'receipts'}")
+    p = sub.add_parser('build-base', help='rebuild base-dev/warm with current packages and actions-runner (sudo)')
+    p.add_argument('--rollback', action='store_true', help='restore the previous base without rebuilding')
     sub.add_parser('acl', help='print the network ACL that install.sh applies')
-    sub.add_parser('job-started', help='runner hook: refuse fork PRs and record the job')
-    p = sub.add_parser('junit', help='print per-test results from JUnit XML reports under DIRs as JSON')
+    p = sub.add_parser('admission-check', help='validate this guest CI admission record')
+    p.add_argument('--expected-primary', required=True)
+    p.add_argument('--overflow-host', nargs='?', action='append', help=argparse.SUPPRESS)
+    sub.add_parser('job-started', help="runner hook: refuse fork PRs or outside users' jobs, and record the job")
+    p = sub.add_parser('junit', help='print per-test results from JUnit XML reports, and ColdVerify test counts, under DIRs as JSON')
     p.add_argument('--newer', help='only reports modified after this file; git-tracked reports are always skipped')
     p.add_argument('--archived', help='file listing paths copied in from git archive; those are skipped too')
     p.add_argument('dirs', nargs='+')
@@ -1417,13 +3507,24 @@ def main(argv=None):
         if args.cmd == 'acl':
             print(json.dumps(acl_document(host_addresses()), indent=2))
             return 0
+        if args.cmd == 'admission-check':
+            return admission_check(args)
         if args.cmd == 'job-started':
-            return job_started()
+            code = 1
+            try:
+                code = job_started()
+            finally:
+                if code:
+                    subprocess.run(['pkill', '-KILL', '-x', 'Runner.Worker'], check=False)
+            return code
+        if args.cmd == 'build-base':
+            signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
         if args.cmd == 'junit':
-            print(json.dumps(junit_summary(args.dirs, args.newer, args.archived)))
+            print(json.dumps(dict(junit_summary(args.dirs, args.newer, args.archived),
+                                  cold_verify=cold_verify_counts(args.dirs, args.newer, args.archived))))
             return 0
-        return dict(detect=detect_cmd, run=run_adhoc if command else run_local, serve=serve, register=register, unregister=unregister,
-                    reap=reap, status=status, vm=vm_cmd, **{'build-base': build_base})[args.cmd](args)
+        return dict(detect=detect_cmd, run=run_repo if args.cmd == 'run' and (args.repo or args.sha) else run_adhoc if command else run_local, serve=serve, register=register, unregister=unregister,
+                    reap=reap, status=status, stats=stats, selftest=selftest, **{'setup-app': setup_app}, vm=vm_cmd, **{'build-base': build_base})[args.cmd](args)
     except ConfigError as error:
         print(f'coldbox: {error}', file=sys.stderr)
         return 2

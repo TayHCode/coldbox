@@ -8,14 +8,14 @@ mkdir -p "$fixture"
 cat > "$fixture/coldbox.toml" <<'EOF'
 [checks]
 lint = false
-test = false
 verify = false
 
 [commands]
 stress = "for i in $(seq 1 20); do python3 -c 'print(sum(range(10**6)))' >/dev/null; sleep 1; done"
 EOF
+printf 'def test_ok():\n    assert 1 + 1 == 2\n' > "$fixture/test_ok.py"
 git -C "$fixture" init -q
-git -C "$fixture" add coldbox.toml
+git -C "$fixture" add coldbox.toml test_ok.py
 git -C "$fixture" -c user.name=stress -c user.email=stress@example.com commit -qm stress
 
 restarts() { systemctl show incus -p NRestarts --value; }

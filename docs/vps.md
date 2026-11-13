@@ -18,10 +18,12 @@ When `/dev/kvm` is missing, `install.sh` and `coldbox status` name what `systemd
 Pick a plan with nested KVM (see [Providers](#providers)), **8 GB of RAM** and a disk of **about 80 GB**. Smaller plans
 are refused or can't run a job:
 
-- **RAM.** Coldbox keeps 2 GiB for the host and starts a job VM only when its memory fits on top. `install.sh` checks the
-  same sum against `MemTotal` and refuses a host below it, giving both figures in MiB and GiB. A job VM gets half the
-  host's RAM by default (2 to 16 GiB, or `--memory`), so the default floor is 4 GiB. A plan sold as "4 GB" shows about
-  3.75 GiB and is refused. On an 8 GB plan the job VM is 3 GiB, and one runs at a time.
+- **RAM.** Coldbox keeps 2 GiB for the host (an eighth of RAM on hosts above 16 GiB) and starts a job VM only when its
+  memory fits on top of what is in use. `install.sh` checks that reserve, 1.5 GiB for the host's own idle use and one job VM
+  against `MemTotal` and refuses a host below it, giving both figures in MiB and GiB. A job VM gets half the
+  host's RAM by default (2 to 16 GiB, or `--memory`), so the default floor is 5.5 GiB. A plan sold as "4 GB" shows about
+  3.75 GiB and is refused. On an 8 GB plan the job VM is 3 GiB, and one runs at a time: a fresh 8 GB host used 0.95 GiB
+  idle, beyond the ZFS cache, which Coldbox counts as free.
 - **Disk.** When it creates the storage pool, `install.sh` needs as much free space under `/var/lib` as the pool can fill:
   `COLDBOX_POOL_SIZE` for the ZFS pool (by default 80% of the free space, 40 to 100 GiB), or one job VM's `--disk`
   (40 GiB by default) for `dir` storage. It refuses less, giving both figures. With the defaults and room for the OS,
@@ -39,8 +41,9 @@ are refused or can't run a job:
   module. `install.sh` checks for the module before it installs anything; when it's missing, it uses plain directories
   and says so. With `COLDBOX_STORAGE=zfs` set, it stops instead and names the fix.
 
-- **Incus.** Install the Zabbly Incus 6.0 LTS first, as the [README](../README.md#requirements) says. `install.sh` refuses
-  the distro Incus on Ubuntu 24.04, Ubuntu 26.04 and Debian 13.
+- **Incus.** The distro Incus on Ubuntu 24.04, Ubuntu 26.04 and Debian 13 is too old (see the
+  [README](../README.md#requirements)). `install.sh` asks before it adds the Zabbly Incus 6.0 LTS repo, or does it with
+  `--install-incus`, and refuses without either.
 
 ## How fast it is
 

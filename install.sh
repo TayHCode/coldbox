@@ -2,10 +2,12 @@
 set -euo pipefail
 
 die() { printf 'coldbox install: %s\n' "$*" >&2; exit 1; }
-usage='usage: sudo ./install.sh [--cpus N] [--memory SIZE] [--disk SIZE] [--checks LIST] [--name-prefix NAME] [--subnet CIDR]   (env: COLDBOX_STORAGE=zfs|dir COLDBOX_POOL_SIZE COLDBOX_CPUS COLDBOX_MEMORY COLDBOX_DISK COLDBOX_CHECKS COLDBOX_NAME_PREFIX COLDBOX_SUBNET COLDBOX_REBUILD=1)'
+usage='usage: sudo ./install.sh [--install-incus] [--cpus N] [--memory SIZE] [--disk SIZE] [--checks LIST] [--name-prefix NAME] [--subnet CIDR]   (env: COLDBOX_STORAGE=zfs|dir COLDBOX_POOL_SIZE COLDBOX_CPUS COLDBOX_MEMORY COLDBOX_DISK COLDBOX_CHECKS COLDBOX_NAME_PREFIX COLDBOX_SUBNET COLDBOX_REBUILD=1)'
+install_incus=0
 while (( $# )); do
     case $1 in
         -h|--help) echo "$usage"; exit 0 ;;
+        --install-incus) install_incus=1; shift ;;
         --cpus|--memory|--disk|--checks|--name-prefix|--subnet)
             (( $# > 1 )) || die "$1 needs a value"
             if [[ $1 == --cpus ]]; then
@@ -79,6 +81,7 @@ source /etc/os-release
 [[ $ID == ubuntu || $ID == debian ]] || die "needs Ubuntu 24.04+ or Debian 13+, found $ID"
 if [[ ! -c /dev/kvm ]]; then
     virt=$(systemd-detect-virt 2>/dev/null || true)
+    [[ $virt != wsl ]] || die '/dev/kvm missing; WSL2 gives Coldbox no KVM, so run it on a Linux machine, see README.md#wsl2'
     [[ -z $virt || $virt == none ]] || die "/dev/kvm missing; this host is a $virt VM or container, so Coldbox needs nested virtualization from its provider, see docs/vps.md"
     die '/dev/kvm missing; enable virtualization (VT-x/AMD-V) in the BIOS'
 fi
@@ -109,14 +112,16 @@ memory=${COLDBOX_MEMORY:-$(clamp $(( mem_kib / 1048576 / 2 )) 2 16)GiB}
 [[ $memory =~ ^([1-9][0-9]*)(MiB|GiB|TiB|MB|GB|TB)$ ]] || die "--memory must be a size such as 8GiB, got '$memory'"
 declare -A unit_bytes=([MiB]=1048576 [GiB]=1073741824 [TiB]=1099511627776 [MB]=1000000 [GB]=1000000000 [TB]=1000000000000)
 host_reserve=$(( 2 << 30 ))
+(( mem_kib * 1024 / 8 > host_reserve )) && host_reserve=$(( mem_kib * 1024 / 8 ))
+host_reserve=$(( host_reserve + (1536 << 20) ))
 need=$(( host_reserve + BASH_REMATCH[1] * unit_bytes[${BASH_REMATCH[2]}] ))
 gib() { awk -v b="$1" 'BEGIN { printf "%.2f", b / 1073741824 }'; }
 (( mem_kib * 1024 >= need )) ||
-    die "needs at least $(( (need + 1048575) >> 20 )) MiB ($(gib "$need") GiB) of RAM, 2048 MiB for the host plus one $memory job VM; found $(( mem_kib >> 10 )) MiB ($(gib $(( mem_kib * 1024 ))) GiB). Use a host with more RAM or a smaller --memory"
+    die "needs at least $(( (need + 1048575) >> 20 )) MiB ($(gib "$need") GiB) of RAM, $(( host_reserve >> 20 )) MiB for the host plus one $memory job VM; found $(( mem_kib >> 10 )) MiB ($(gib $(( mem_kib * 1024 ))) GiB). Use a host with more RAM or a smaller --memory"
 free_bytes=$(df --output=avail -B1 /var/lib | tail -1 | tr -dc 0-9)
 free_gib=$(( free_bytes >> 30 ))
 storage=${COLDBOX_STORAGE:-zfs}
-pool_size=${COLDBOX_POOL_SIZE:-$(clamp $(( free_gib * 8 / 10 )) 40 100)GiB}
+pool_size=${COLDBOX_POOL_SIZE:-$(clamp $(( free_gib * 8 / 10 )) 56 100)GiB}
 cpus=${COLDBOX_CPUS:-$(clamp $(( $(nproc) / 2 )) 2 8)}
 disk=${COLDBOX_DISK:-40GiB}
 [[ $storage == zfs || $storage == dir ]] || die 'COLDBOX_STORAGE must be zfs or dir'
@@ -142,9 +147,35 @@ incus_crashes() {
 }
 # shellcheck disable=SC2016
 zabbly_lts='sudo curl -fsSLo /etc/apt/keyrings/zabbly.asc https://pkgs.zabbly.com/key.asc && printf "Types: deb\nURIs: https://pkgs.zabbly.com/incus/lts-6.0\nSuites: %s\nComponents: main\nSigned-By: /etc/apt/keyrings/zabbly.asc\n" "$(. /etc/os-release && echo $VERSION_CODENAME)" | sudo tee /etc/apt/sources.list.d/zabbly-incus-lts-6.0.sources >/dev/null && sudo apt-get update && sudo apt-get install -y incus'
-incus_version=$(apt-cache policy incus | sed -n 's/^ *Candidate: \([0-9]*:\)\{0,1\}\([0-9.]*\).*/\2/p')
+incus_candidate() { apt-cache policy incus | sed -n 's/^ *Candidate: \([0-9]*:\)\{0,1\}\([0-9.]*\).*/\2/p'; }
+incus_version=$(incus_candidate)
 if incus_crashes "$incus_version"; then
-    die "Incus $incus_version crashes under parallel jobs and kills every running one (lxc/incus#2865, fixed in 6.0.6). Install the Zabbly Incus 6.0 LTS, then rerun with COLDBOX_REBUILD=1: $zabbly_lts && sudo COLDBOX_REBUILD=1 ./install.sh"
+    crash="Incus $incus_version crashes under parallel jobs and kills every running one (lxc/incus#2865, fixed in 6.0.6)."
+    if (( ! install_incus )) && [[ -t 0 && -t 1 ]]; then
+        answer=
+        read -rp "$crash Add the Zabbly Incus 6.0 LTS apt repo (pkgs.zabbly.com) and install Incus from it? [y/N] " answer || true
+        [[ $answer =~ ^([Yy]|[Yy][Ee][Ss])$ ]] && install_incus=1
+    fi
+    (( install_incus )) ||
+        die "$crash No apt repository was added. Rerun with --install-incus to add the Zabbly Incus 6.0 LTS repo and install it, or do it yourself: $zabbly_lts && sudo COLDBOX_REBUILD=1 ./install.sh"
+    [[ ! -e /etc/apt/sources.list.d/zabbly-incus-lts-6.0.sources ]] ||
+        die "Incus $incus_version is the apt candidate although /etc/apt/sources.list.d/zabbly-incus-lts-6.0.sources exists; check that repo and any apt pinning of incus"
+    echo "coldbox install: adding the Zabbly Incus 6.0 LTS repo for $VERSION_CODENAME"
+    install -d -m 755 /etc/coldbox
+    touch /etc/coldbox/rebuild-base
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -q curl ca-certificates
+    install -d -m 755 /etc/apt/keyrings
+    curl -fsSLo /etc/apt/keyrings/zabbly.asc https://pkgs.zabbly.com/key.asc
+    printf 'Types: deb\nURIs: https://pkgs.zabbly.com/incus/lts-6.0\nSuites: %s\nComponents: main\nSigned-By: /etc/apt/keyrings/zabbly.asc\n' \
+        "$VERSION_CODENAME" >/etc/apt/sources.list.d/zabbly-incus-lts-6.0.sources
+    if ! apt-get update -q; then
+        rm -f /etc/apt/sources.list.d/zabbly-incus-lts-6.0.sources
+        die "apt-get update failed with the Zabbly repo for $VERSION_CODENAME, so it was removed again; see https://github.com/zabbly/incus"
+    fi
+    incus_version=$(incus_candidate)
+    if [[ ! $incus_version =~ ^[0-9] ]] || incus_crashes "$incus_version"; then
+        die "the Zabbly repo offers Incus ${incus_version:-none} for $VERSION_CODENAME, not 6.0.6 or newer; see https://github.com/zabbly/incus"
+    fi
 fi
 DEBIAN_FRONTEND=noninteractive apt-get install -y -q "${packages[@]}"
 gh_dir=$(dirname "${gh_path:-/usr/bin/gh}")
@@ -189,6 +220,9 @@ printf 'COLDBOX_NAME_PREFIX=%s\nCOLDBOX_SUBNET=%s\n' "$prefix" "$subnet" >"$incu
 chmod 644 "$incus_env.new"
 mv -f "$incus_env.new" "$incus_env"
 if ! claim storage "$prefix"; then
+    [[ $disk =~ ^([1-9][0-9]*)(MiB|GiB|TiB|MB|GB|TB)$ ]] || die "--disk must be a size such as 40GiB, got '$disk'"
+    pool_need=$(( (BASH_REMATCH[1] * unit_bytes[${BASH_REMATCH[2]}] + (10 << 30)) * 10 / 9 ))
+    [[ $storage != zfs ]] || (( floor_bytes >= pool_need )) || die "a $pool_size ZFS pool cannot start a $disk job VM: admission needs one --disk plus a tenth of the pool free, after about 10 GiB of base images; set COLDBOX_POOL_SIZE to at least $(( (pool_need + (1 << 30) - 1) >> 30 ))GiB or a smaller --disk"
     (( free_bytes >= floor_bytes )) || die "needs $floor free under /var/lib for $floor_use ($floor_name), found $(gib "$free_bytes") GiB; free some space or set a smaller $floor_name"
     if [[ $storage == zfs ]]; then ic storage create "$prefix" zfs size="$pool_size" "$mark"
     else ic storage create "$prefix" dir "$mark"; fi
@@ -231,7 +265,8 @@ if command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then
         fi
     done
 fi
-install -m 755 "$here/coldbox" /usr/local/bin/coldbox
+install -m 755 "$here/coldbox" /usr/local/bin/coldbox.next
+mv -f /usr/local/bin/coldbox.next /usr/local/bin/coldbox
 if [[ -n $checks ]]; then
     install -d -m 755 "${host_checks%/*}"
     {
@@ -282,6 +317,31 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
+cat >/etc/systemd/system/coldbox-selftest.service <<EOF
+[Unit]
+Description=Prove in a throwaway VM that Coldbox job VMs are isolated and held to the profile limits
+After=incus.service network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=3h
+StartLimitBurst=3
+[Service]
+Type=oneshot
+User=$user
+SupplementaryGroups=incus-admin
+ExecStart=/usr/local/bin/coldbox selftest isolation
+Restart=on-failure
+RestartSec=30min
+EOF
+cat >/etc/systemd/system/coldbox-selftest.timer <<EOF
+[Unit]
+Description=Run the Coldbox isolation selftest weekly
+[Timer]
+OnCalendar=weekly
+RandomizedDelaySec=6h
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
 cat >/etc/systemd/system/coldbox-runner@.service <<EOF
 [Unit]
 Description=Coldbox ephemeral GitHub runner for %I
@@ -293,17 +353,20 @@ SupplementaryGroups=incus-admin
 Environment=PATH=$gh_dir:/usr/local/bin:/usr/bin:/bin
 ExecStart=/usr/local/bin/coldbox serve %I
 SuccessExitStatus=143
-Restart=on-failure
+KillMode=mixed
+TimeoutStopSec=21600
+Restart=always
 RestartSec=30
 [Install]
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
-systemctl enable --now coldbox-reap.timer coldbox-refresh.timer
+systemctl enable --now coldbox-reap.timer coldbox-refresh.timer coldbox-selftest.timer
 echo "coldbox install: job VMs get $cpus vCPU, $memory RAM, $disk disk (--cpus/--memory/--disk override)"
 
-if [[ ${COLDBOX_REBUILD:-} == 1 ]] || ! icp snapshot show base-dev warm >/dev/null 2>&1; then
+if [[ ${COLDBOX_REBUILD:-} == 1 || -e /etc/coldbox/rebuild-base ]] || ! icp snapshot show base-dev warm >/dev/null 2>&1; then
     /usr/local/bin/coldbox build-base
+    rm -f /etc/coldbox/rebuild-base
 else
     echo 'coldbox install: PASS base-dev/warm already exists (COLDBOX_REBUILD=1 rebuilds it)'
 fi

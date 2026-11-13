@@ -2,7 +2,7 @@
   "schema": "coldbox.receipt/v1",
   "id": "cbx-1793850054-43d1de",
   "mode": "runner",
-  "repo": "TayHCode/example-repo",
+  "repo": "example-owner/example-repo",
   "sha": "47eb51b670cd4ee8e6c96678713d1538fe712edf",
   "verdict": "pass",
   "checks": [
@@ -46,7 +46,7 @@
   "job_name": "checks",
   "job_result": "Succeeded",
   "github": {
-    "repo": "TayHCode/example-repo",
+    "repo": "example-owner/example-repo",
     "sha": "47eb51b670cd4ee8e6c96678713d1538fe712edf",
     "ref": "refs/heads/main",
     "event": "workflow_dispatch",
@@ -54,7 +54,7 @@
     "job": "checks",
     "run_id": "41963130060",
     "run_attempt": "1",
-    "actor": "TayHCode",
+    "actor": "example-owner",
     "fork_pr": false,
     "refused": null
   },
@@ -562,5 +562,7 @@
       }
     ]
   },
-  "seconds": 142.3
+  "seconds": 142.3,
+  "tests_ran": 70,
+  "tests_source": "junit"
 }

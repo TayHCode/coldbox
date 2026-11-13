@@ -1,0 +1,7 @@
+[checks]
+lint = true
+test = true
+verify = false
+
+[commands]
+lint = "python3 -m compileall -q -x '/[.]|node_modules' . && git ls-files -z '*.sh' | xargs -0 shellcheck"

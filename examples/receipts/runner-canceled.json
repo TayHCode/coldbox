@@ -2,7 +2,7 @@
   "schema": "coldbox.receipt/v1",
   "id": "cbx-1794156659-fb178d",
   "mode": "runner",
-  "repo": "TayHCode/example-repo",
+  "repo": "example-owner/example-repo",
   "sha": "f1f7585e949ef0fe9ac41901a6f4ac8a7d4acff1",
   "verdict": "canceled",
   "checks": [],
@@ -24,7 +24,7 @@
   "job_name": "verify",
   "job_result": "Canceled",
   "github": {
-    "repo": "TayHCode/example-repo",
+    "repo": "example-owner/example-repo",
     "sha": "f1f7585e949ef0fe9ac41901a6f4ac8a7d4acff1",
     "ref": "refs/pull/82/merge",
     "event": "pull_request",
@@ -32,7 +32,7 @@
     "job": "verify",
     "run_id": "42501953470",
     "run_attempt": "1",
-    "actor": "TayHCode",
+    "actor": "example-owner",
     "fork_pr": false,
     "refused": null
   },

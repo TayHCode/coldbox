@@ -18,8 +18,8 @@ Install Coldbox on this machine so it can run CI jobs in throwaway VMs.
    `--checks setup,lint,test,verify` for all of them, `--checks lint,test`, or `--checks none`. Always pass it, so
    an earlier choice on this host is replaced. It is safe to re-run. If it fails, read the error, fix the cause
    (for example a missing package or a firewall rule), and run it again. Do not edit install.sh to skip a step.
-5. Run `coldbox status`. Every line must say PASS; each FAIL prints its fix. If gh is not logged in, ask me to run
-   `gh auth login`.
+5. Run `coldbox status`. Every line must say PASS; each FAIL prints its fix. If the `GitHub auth` line fails or warns,
+   ask me to run `coldbox setup-app` and follow its steps.
 6. Prove it works: `coldbox run ~/coldbox`. Show me the last 10 lines and the receipt path it prints,
    then `coldbox status` again to show that no job VM is left behind.
 7. Report: what was installed, the VM size install.sh chose, the checks on by default, the receipt verdict, and anything you could not verify.

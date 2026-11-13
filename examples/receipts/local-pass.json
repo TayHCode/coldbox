@@ -70,5 +70,7 @@
       }
     ]
   },
-  "seconds": 24.15
+  "seconds": 24.15,
+  "tests_ran": 2,
+  "tests_source": "junit"
 }

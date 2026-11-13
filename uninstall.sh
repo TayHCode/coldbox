@@ -22,10 +22,12 @@ for unit in "${runners[@]}"; do
     systemctl disable --now "$unit" || true
     rm -rf "/etc/systemd/system/$unit.d"
 done
-systemctl disable --now coldbox-reap.timer coldbox-refresh.timer 2>/dev/null || true
+systemctl disable --now coldbox-reap.timer coldbox-refresh.timer coldbox-selftest.timer 2>/dev/null || true
+systemctl stop coldbox-selftest.service 2>/dev/null || true
 rm -f /etc/systemd/system/coldbox-reap.service /etc/systemd/system/coldbox-reap.timer \
     /etc/systemd/system/coldbox-refresh.service /etc/systemd/system/coldbox-refresh.timer \
-    /etc/systemd/system/coldbox-runner@.service /usr/local/bin/coldbox /etc/coldbox/checks.toml
+    /etc/systemd/system/coldbox-selftest.service /etc/systemd/system/coldbox-selftest.timer \
+    /etc/systemd/system/coldbox-runner@.service /usr/local/bin/coldbox /etc/coldbox/checks.toml /etc/coldbox/rebuild-base
 systemctl daemon-reload
 
 if owned project "$prefix"; then

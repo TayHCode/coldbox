@@ -12,9 +12,9 @@ Set up Coldbox so OWNER/REPO runs its CI in throwaway VMs on this machine. Stop 
      and tell me in 3 lines what install.sh will change on this host.
    - Run `sudo ~/coldbox/install.sh`. If it stops, it prints the fix; apply it and run it again.
      Never edit install.sh to skip a check.
-   - `coldbox status` must pass every check. If `gh is logged in` fails, ASK me to run `gh auth login`.
-2. Check the repo. `gh repo view OWNER/REPO --json visibility` must say PRIVATE. If not, ASK: on a public repo a
-   fork's pull request can run code on this machine. Never pass --allow-public or --allow-forks on your own.
+   - `coldbox status` must pass every check. If the `GitHub auth` line fails or warns, ASK me to run `coldbox setup-app` and follow its steps.
+2. Check the repo is private. `coldbox register` checks this itself and refuses a public repo. If it refuses, ASK: on
+   a public repo a fork's pull request can run code on this machine. Never pass --allow-public or --allow-forks on your own.
 3. Pick checks. Clone the repo, run `coldbox detect <path>`, read its README, existing workflows and build files. On a
    new branch, write coldbox.toml and commit it (`coldbox run` uses the committed HEAD). Switch a check off only with a
    one-line reason comment.

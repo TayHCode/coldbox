@@ -2,7 +2,7 @@
   "schema": "coldbox.receipt/v1",
   "id": "cbx-1793991089-3df0ad",
   "mode": "runner",
-  "repo": "TayHCode/example-repo",
+  "repo": "example-owner/example-repo",
   "sha": null,
   "verdict": "idle",
   "checks": [],
